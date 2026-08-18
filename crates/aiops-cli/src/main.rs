@@ -1,5 +1,7 @@
-use aiops_core::resources::ResourceKind;
-use aiops_k8s::{client::KubernetesClient, convert::resource_ref, pods::list};
+use aiops_k8s::{
+    client::KubernetesClient,
+    pods::{list, health},
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -8,7 +10,7 @@ async fn main() -> anyhow::Result<()> {
     for pod in list(client.inner(), Some("mediaserver-system"))
         .await?
         .iter()
-        .map(|p| resource_ref(p, ResourceKind::Pod))
+        .map(health)
     {
         println!("{pod:#?}");
     }
