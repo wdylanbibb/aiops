@@ -1,6 +1,5 @@
 use aiops_core::{
-    health::{HealthObservation, HealthState},
-    resources::{ResourceCondition, ResourceKind, ResourceSnapshot},
+    observations::{HealthObservation, HealthState}, resources::{ResourceCondition, ResourceKind, ResourceSnapshot}
 };
 use chrono::{DateTime, Utc};
 use k8s_openapi::api::core::v1::Pod;
