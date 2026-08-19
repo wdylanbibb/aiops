@@ -1,5 +1,6 @@
 use aiops_core::{
-    observations::{HealthObservation, HealthState}, resources::{ResourceCondition, ResourceKind, ResourceSnapshot}
+    observations::{HealthObservation, HealthState},
+    resources::{ResourceCondition, ResourceKind, ResourceMetadata, ResourceSnapshot},
 };
 use chrono::{DateTime, Utc};
 use k8s_openapi::api::core::v1::Pod;
@@ -21,9 +22,23 @@ pub async fn get(client: Client, namespace: &str, name: &str) -> Result<Pod, kub
 }
 
 pub fn snapshot(pod: &Pod) -> ResourceSnapshot {
+    let metadata = &pod.metadata;
+
     ResourceSnapshot {
         resource: resource_ref(pod, ResourceKind::Pod),
         observed_at: Utc::now(),
+        metadata: ResourceMetadata {
+            labels: metadata.labels.clone().unwrap_or_default(),
+            annotations: metadata.annotations.clone().unwrap_or_default(),
+            generation: metadata.generation,
+            observed_generation: None,
+            deletion_timestamp: metadata.deletion_timestamp.as_ref().map(|time| {
+                let secs = time.0.as_second();
+                let nsecs = time.0.subsec_nanosecond() as u32;
+
+                DateTime::from_timestamp(secs, nsecs).unwrap_or_default()
+            }),
+        },
         conditions: pod
             .status
             .as_ref()
@@ -72,19 +87,28 @@ pub fn health(pod: &Pod) -> HealthObservation {
         _ => HealthState::Unknown,
     };
 
-    let started_at = status.and_then(|status| status.start_time.as_ref()).map(|time| {
-        let secs = time.0.as_second();
-        let nsecs = time.0.subsec_nanosecond() as u32;
+    let started_at = status
+        .and_then(|status| status.start_time.as_ref())
+        .map(|time| {
+            let secs = time.0.as_second();
+            let nsecs = time.0.subsec_nanosecond() as u32;
 
-        DateTime::from_timestamp(secs, nsecs).unwrap_or_default()
-    });
+            DateTime::from_timestamp(secs, nsecs).unwrap_or_default()
+        });
 
-    let ready_since = status.and_then(|status| status.conditions.as_ref()).into_iter().flatten().find(|condition| condition.type_ == "Ready" && condition.status == "True").and_then(|condition| condition.last_transition_time.as_ref().map(|time| {
-        let secs = time.0.as_second();
-        let nsecs = time.0.subsec_nanosecond() as u32;
+    let ready_since = status
+        .and_then(|status| status.conditions.as_ref())
+        .into_iter()
+        .flatten()
+        .find(|condition| condition.type_ == "Ready" && condition.status == "True")
+        .and_then(|condition| {
+            condition.last_transition_time.as_ref().map(|time| {
+                let secs = time.0.as_second();
+                let nsecs = time.0.subsec_nanosecond() as u32;
 
-        DateTime::from_timestamp(secs, nsecs).unwrap_or_default()
-    }));
+                DateTime::from_timestamp(secs, nsecs).unwrap_or_default()
+            })
+        });
 
     HealthObservation {
         resource: resource_ref(pod, ResourceKind::Pod),

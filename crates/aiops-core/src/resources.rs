@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -33,7 +35,17 @@ pub enum ResourceKind {
 pub struct ResourceSnapshot {
     pub resource: ResourceRef,
     pub observed_at: DateTime<Utc>,
+    pub metadata: ResourceMetadata,
     pub conditions: Vec<ResourceCondition>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ResourceMetadata {
+    pub labels: BTreeMap<String, String>,
+    pub annotations: BTreeMap<String, String>,
+    pub generation: Option<i64>,
+    pub observed_generation: Option<i64>,
+    pub deletion_timestamp: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
