@@ -1,18 +1,19 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::resources::{ResourceRef, ResourceSnapshot};
-pub use crate::{
-    observations::{
-        health::{HealthObservation, HealthState},
-        logs::{LogEntry, LogStream},
-        events::{ResourceEvent, EventType},
-    }
+pub use crate::observations::{
+    events::{EventType, ResourceEvent},
+    health::{
+        ContainerHealth, ContainerKind, ContainerState, ContainerTermination, HealthObservation,
+        HealthState,
+    },
+    logs::{LogEntry, LogStream},
 };
+use crate::resources::{ResourceRef, ResourceSnapshot};
 
+mod events;
 mod health;
 mod logs;
-mod events;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObservationBundle {
