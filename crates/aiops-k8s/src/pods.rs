@@ -16,6 +16,10 @@ pub async fn list(client: Client, namespace: Option<&str>) -> Result<Vec<Pod>, k
     Ok(pods.list(&ListParams::default()).await?.items)
 }
 
+pub async fn get(client: Client, namespace: &str, name: &str) -> Result<Pod, kube::Error> {
+    Api::<Pod>::namespaced(client, namespace).get(name).await
+}
+
 pub fn snapshot(pod: &Pod) -> ResourceSnapshot {
     ResourceSnapshot {
         resource: resource_ref(pod, ResourceKind::Pod),
