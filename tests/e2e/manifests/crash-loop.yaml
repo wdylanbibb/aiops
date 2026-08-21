@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: crash-loop
+  namespace: aiops-e2e
+  labels:
+    app.kubernetes.io/name: crash-loop
+    app.kubernetes.io/part-of: aiops-e2e
+    aiops.dev/scenario: crash-loop
+spec:
+  restartPolicy: Always
+  terminationGracePeriodSeconds: 1
+  containers:
+    - name: app
+      image: busybox:1.36.1
+      imagePullPolicy: IfNotPresent
+      command: ["sh", "-c"]
+      args:
+        - |
+          echo "panic: simulated startup failure"
+          echo "fatal error: required dependency is unavailable"
+          exit 1
+      resources:
+        requests:
+          cpu: 5m
+          memory: 8Mi
+        limits:
+          cpu: 50m
+          memory: 32Mi

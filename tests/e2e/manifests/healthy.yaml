@@ -1,0 +1,36 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: healthy
+  namespace: aiops-e2e
+  labels:
+    app.kubernetes.io/name: healthy
+    app.kubernetes.io/part-of: aiops-e2e
+    aiops.dev/scenario: healthy
+spec:
+  restartPolicy: Always
+  terminationGracePeriodSeconds: 1
+  containers:
+    - name: app
+      image: busybox:1.36.1
+      imagePullPolicy: IfNotPresent
+      command: ["sh", "-c"]
+      args:
+        - |
+          echo "application started successfully"
+          while true; do
+            echo "health check completed"
+            sleep 30
+          done
+      readinessProbe:
+        exec:
+          command: ["sh", "-c", "exit 0"]
+        initialDelaySeconds: 1
+        periodSeconds: 2
+      resources:
+        requests:
+          cpu: 5m
+          memory: 8Mi
+        limits:
+          cpu: 50m
+          memory: 32Mi

@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: image-pull-error
+  namespace: aiops-e2e
+  labels:
+    app.kubernetes.io/name: image-pull-error
+    app.kubernetes.io/part-of: aiops-e2e
+    aiops.dev/scenario: image-pull-error
+spec:
+  restartPolicy: Always
+  terminationGracePeriodSeconds: 1
+  containers:
+    - name: app
+      # RFC 6761 reserves .invalid, so this image can never resolve successfully.
+      image: registry.invalid/aiops/fixture:v1
+      imagePullPolicy: Always
+      command: ["sh", "-c"]
+      args: ["sleep 3600"]
+      resources:
+        requests:
+          cpu: 5m
+          memory: 8Mi
+        limits:
+          cpu: 50m
+          memory: 32Mi
