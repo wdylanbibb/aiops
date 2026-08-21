@@ -236,3 +236,116 @@ fn timestamp(time: &k8s_openapi::apimachinery::pkg::apis::meta::v1::Time) -> Dat
 
     DateTime::from_timestamp(secs, nsecs).unwrap_or_default()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aiops_core::resources::ConditionStatus;
+    use serde_json::json;
+
+    fn pod(value: serde_json::Value) -> Pod {
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn snapshot_copies_metadata_and_normalizes_conditions() {
+        let pod = pod(json!({
+            "metadata": {
+                "name": "api-0",
+                "namespace": "production",
+                "uid": "uid-1",
+                "generation": 4,
+                "labels": {"app": "api"},
+                "annotations": {"owner": "platform"}
+            },
+            "spec": {"containers": []},
+            "status": {"conditions": [{
+                "type": "Ready", "status": "False", "reason": "ContainersNotReady"
+            }, {
+                "type": "Custom", "status": "Maybe"
+            }]}
+        }));
+
+        let snapshot = snapshot(&pod);
+        assert_eq!(snapshot.resource.name, "api-0");
+        assert_eq!(snapshot.metadata.generation, Some(4));
+        assert_eq!(
+            snapshot.metadata.labels.get("app").map(String::as_str),
+            Some("api")
+        );
+        assert_eq!(snapshot.conditions[0].status, ConditionStatus::False);
+        assert_eq!(snapshot.conditions[1].status, ConditionStatus::Unknown);
+    }
+
+    #[test]
+    fn health_marks_running_ready_pod_healthy_and_sums_restarts() {
+        let pod = pod(json!({
+            "metadata": {"name": "api-0", "namespace": "default"},
+            "spec": {"containers": [{"name": "api", "image": "api"}]},
+            "status": {
+                "phase": "Running",
+                "conditions": [{"type": "Ready", "status": "True"}],
+                "containerStatuses": [{
+                    "name": "api", "image": "api", "imageID": "sha256:x",
+                    "ready": true, "restartCount": 2, "started": true,
+                    "state": {"running": {}}
+                }]
+            }
+        }));
+
+        let health = health(&pod);
+        assert_eq!(health.state, HealthState::Healthy);
+        assert_eq!(health.restart_count, Some(2));
+        assert_eq!(health.containers.len(), 1);
+        assert_eq!(health.containers[0].kind, ContainerKind::Application);
+        assert!(matches!(
+            health.containers[0].state,
+            HealthContainerState::Running { .. }
+        ));
+    }
+
+    #[test]
+    fn crash_loop_takes_precedence_over_running_phase() {
+        let pod = pod(json!({
+            "metadata": {"name": "api-0", "namespace": "default"},
+            "spec": {"containers": [{"name": "api", "image": "api"}]},
+            "status": {
+                "phase": "Running",
+                "conditions": [{"type": "Ready", "status": "False"}],
+                "containerStatuses": [{
+                    "name": "api", "image": "api", "imageID": "sha256:x",
+                    "ready": false, "restartCount": -1, "started": false,
+                    "state": {"waiting": {"reason": "CrashLoopBackOff"}},
+                    "lastState": {"terminated": {"exitCode": 137, "reason": "OOMKilled"}}
+                }]
+            }
+        }));
+
+        let health = health(&pod);
+        assert_eq!(health.state, HealthState::Unhealthy);
+        assert_eq!(health.restart_count, Some(0));
+        assert_eq!(health.containers[0].restart_count, 0);
+        assert_eq!(
+            health.containers[0]
+                .last_termination
+                .as_ref()
+                .unwrap()
+                .exit_code,
+            137
+        );
+    }
+
+    #[test]
+    fn deletion_timestamp_takes_precedence_over_failure() {
+        let pod = pod(json!({
+            "metadata": {
+                "name": "api-0", "namespace": "default",
+                "deletionTimestamp": "2026-01-01T00:00:00Z"
+            },
+            "spec": {"containers": []},
+            "status": {"phase": "Failed"}
+        }));
+
+        assert_eq!(health(&pod).state, HealthState::Terminating);
+    }
+}

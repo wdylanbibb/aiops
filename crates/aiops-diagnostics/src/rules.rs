@@ -579,3 +579,228 @@ fn excerpt(message: &str, maximum_chars: usize) -> String {
         excerpt
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aiops_core::{
+        diagnostics::DiagnosticRule,
+        observations::{
+            CollectionError, ContainerKind, HealthObservation, LogStream, ObservationBundle,
+            ResourceEvent,
+        },
+        resources::{ResourceCondition, ResourceKind},
+    };
+    use chrono::TimeZone;
+
+    fn at() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap()
+    }
+
+    fn resource(name: &str) -> ResourceRef {
+        ResourceRef {
+            kind: ResourceKind::Pod,
+            namespace: Some("default".into()),
+            name: name.into(),
+            uid: None,
+        }
+    }
+
+    fn bundle() -> ObservationBundle {
+        ObservationBundle {
+            target: resource("api-0"),
+            collected_from: at(),
+            collected_at: at(),
+            resources: vec![],
+            logs: vec![],
+            events: vec![],
+            health: vec![],
+            errors: Vec::<CollectionError>::new(),
+        }
+    }
+
+    fn container(name: &str, restart_count: u32, state: ContainerState) -> ContainerHealth {
+        ContainerHealth {
+            name: name.into(),
+            kind: ContainerKind::Application,
+            ready: false,
+            restart_count,
+            state,
+            last_termination: None,
+        }
+    }
+
+    #[test]
+    fn pod_not_ready_uses_condition_for_confidence_and_guidance() {
+        let mut input = bundle();
+        input.health.push(HealthObservation {
+            resource: resource("api-0"),
+            observed_at: at(),
+            state: HealthState::Unhealthy,
+            started_at: None,
+            ready_since: None,
+            restart_count: None,
+            conditions: vec![ResourceCondition {
+                condition_type: "Ready".into(),
+                status: ConditionStatus::False,
+                reason: Some("ContainersNotReady".into()),
+                message: Some("api is unready".into()),
+            }],
+            containers: vec![],
+        });
+
+        let findings = PodNotReadyRule.evaluate(&input);
+        assert_eq!(findings.len(), 1);
+        assert!(matches!(findings[0].severity, Severity::Critical));
+        assert!(matches!(findings[0].confidence, Confidence::High));
+        assert!(findings[0].explanation.contains("api is unready"));
+        assert!(
+            findings[0]
+                .recommendations
+                .iter()
+                .any(|item| item.contains("termination details"))
+        );
+    }
+
+    #[test]
+    fn pod_not_ready_ignores_non_actionable_health_states() {
+        let mut input = bundle();
+        for state in [
+            HealthState::Healthy,
+            HealthState::Terminating,
+            HealthState::Unknown,
+        ] {
+            input.health.push(HealthObservation {
+                resource: resource("api-0"),
+                observed_at: at(),
+                state,
+                started_at: None,
+                ready_since: None,
+                restart_count: None,
+                conditions: vec![],
+                containers: vec![],
+            });
+        }
+        assert!(PodNotReadyRule.evaluate(&input).is_empty());
+    }
+
+    #[test]
+    fn restart_rule_prioritizes_crash_loop_over_oom_termination() {
+        let mut input = bundle();
+        let mut crashing = container(
+            "api",
+            4,
+            ContainerState::Waiting {
+                reason: Some("CrashLoopBackOff".into()),
+                message: None,
+            },
+        );
+        crashing.last_termination = Some(ContainerTermination {
+            reason: Some("OOMKilled".into()),
+            message: None,
+            exit_code: 137,
+            signal: None,
+            started_at: None,
+            finished_at: Some(at()),
+        });
+        input.health.push(HealthObservation {
+            resource: resource("api-0"),
+            observed_at: at(),
+            state: HealthState::Unhealthy,
+            started_at: None,
+            ready_since: None,
+            restart_count: Some(4),
+            conditions: vec![],
+            containers: vec![crashing],
+        });
+
+        let findings = ContainerRestartRule.evaluate(&input);
+        assert_eq!(findings[0].code, "container.restart.crash_loop");
+        assert!(matches!(findings[0].severity, Severity::Critical));
+        assert_eq!(findings[0].evidence.len(), 3);
+        assert!(
+            findings[0]
+                .recommendations
+                .iter()
+                .any(|item| item.contains("memory limit"))
+        );
+    }
+
+    #[test]
+    fn restart_rule_ignores_containers_that_never_restarted() {
+        let mut input = bundle();
+        input.health.push(HealthObservation {
+            resource: resource("api-0"),
+            observed_at: at(),
+            state: HealthState::Healthy,
+            started_at: None,
+            ready_since: None,
+            restart_count: Some(0),
+            conditions: vec![],
+            containers: vec![container("api", 0, ContainerState::Unknown)],
+        });
+        assert!(ContainerRestartRule.evaluate(&input).is_empty());
+    }
+
+    #[test]
+    fn warning_event_rule_filters_normal_events_and_specializes_advice() {
+        let mut input = bundle();
+        for event_type in [EventType::Normal, EventType::Warning] {
+            input.events.push(ResourceEvent {
+                regarding: resource("api-0"),
+                reporting_controller: None,
+                event_type,
+                reason: Some("FailedScheduling".into()),
+                message: "0/3 nodes available".into(),
+                first_seen: None,
+                last_seen: Some(at()),
+                count: 2,
+            });
+        }
+
+        let findings = WarningEventRule.evaluate(&input);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].code, "kubernetes.event.failedscheduling");
+        assert_eq!(findings[0].recommendations.len(), 3);
+    }
+
+    #[test]
+    fn log_patterns_are_case_insensitive_grouped_and_evidence_is_capped() {
+        let mut input = bundle();
+        for index in 0..7 {
+            input.logs.push(LogEntry {
+                resource: resource("api-0"),
+                timestamp: Some(at()),
+                container: Some("api".into()),
+                stream: LogStream::Stderr,
+                message: format!("PANIC: failure number {index}"),
+                previous_container: index == 0,
+            });
+        }
+        input.logs.push(LogEntry {
+            resource: resource("api-0"),
+            timestamp: None,
+            container: Some("worker".into()),
+            stream: LogStream::Stderr,
+            message: "connection refused".into(),
+            previous_container: false,
+        });
+
+        let mut findings = LogPatternRule.evaluate(&input);
+        findings.sort_by(|left, right| left.code.cmp(&right.code));
+        assert_eq!(findings.len(), 2);
+        let crash = findings
+            .iter()
+            .find(|finding| finding.code == "log.process_crash")
+            .unwrap();
+        assert_eq!(crash.evidence.len(), 5);
+        assert!(crash.explanation.contains("7 log line(s)"));
+        assert!(crash.evidence[0].summary.contains("(previous)"));
+    }
+
+    #[test]
+    fn excerpt_flattens_unicode_safely_and_marks_truncation() {
+        assert_eq!(excerpt("a\nb\r\nc", 20), "a b  c");
+        assert_eq!(excerpt("éclair", 2), "éc…");
+    }
+}

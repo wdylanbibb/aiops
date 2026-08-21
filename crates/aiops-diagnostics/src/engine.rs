@@ -38,6 +38,7 @@ impl DiagnosticEngine {
             generated_at: Utc::now(),
             findings,
             incomplete: !bundle.errors.is_empty(),
+            collection_errors: bundle.errors.clone(),
         }
     }
 }
@@ -139,4 +140,116 @@ fn compare_findings(left: &Finding, right: &Finding) -> Ordering {
         .then_with(|| format!("{:?}", left.subject.kind).cmp(&format!("{:?}", right.subject.kind)))
         .then_with(|| left.container.cmp(&right.container))
         .then_with(|| left.code.cmp(&right.code))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aiops_core::{
+        diagnostics::Evidence,
+        observations::{CollectionError, ObservationSource},
+        resources::ResourceKind,
+    };
+    use chrono::TimeZone;
+
+    fn resource(name: &str) -> ResourceRef {
+        ResourceRef {
+            kind: ResourceKind::Pod,
+            namespace: Some("default".into()),
+            name: name.into(),
+            uid: None,
+        }
+    }
+
+    fn finding(name: &str, code: &str, severity: Severity, confidence: Confidence) -> Finding {
+        Finding {
+            code: code.into(),
+            severity,
+            confidence,
+            subject: resource(name),
+            container: None,
+            title: format!("{code} title"),
+            explanation: format!("{code} explanation"),
+            evidence: vec![],
+            recommendations: vec![],
+        }
+    }
+
+    #[test]
+    fn deduplication_merges_unique_details_and_keeps_strongest_content() {
+        let timestamp = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let mut weak = finding("api-0", "same", Severity::Warning, Confidence::Low);
+        weak.evidence.push(Evidence {
+            source: ObservationSource::Logs,
+            summary: "first".into(),
+            timestamp: Some(timestamp),
+        });
+        weak.recommendations.push("inspect logs".into());
+        let mut strong = finding("api-0", "same", Severity::Critical, Confidence::High);
+        strong.title = "strong title".into();
+        strong.evidence.push(Evidence {
+            source: ObservationSource::Logs,
+            summary: "first".into(),
+            timestamp: Some(timestamp),
+        });
+        strong.evidence.push(Evidence {
+            source: ObservationSource::Events,
+            summary: "second".into(),
+            timestamp: None,
+        });
+        strong
+            .recommendations
+            .extend(["inspect logs".into(), "restart safely".into()]);
+        let mut findings = vec![weak, strong];
+
+        deduplicate_and_rank(&mut findings);
+
+        assert_eq!(findings.len(), 1);
+        assert!(matches!(findings[0].severity, Severity::Critical));
+        assert!(matches!(findings[0].confidence, Confidence::High));
+        assert_eq!(findings[0].title, "strong title");
+        assert_eq!(findings[0].evidence.len(), 2);
+        assert_eq!(findings[0].recommendations.len(), 2);
+    }
+
+    #[test]
+    fn ranking_is_severity_then_confidence_then_identity() {
+        let mut findings = vec![
+            finding("z", "warning-low", Severity::Warning, Confidence::Low),
+            finding("b", "critical-low", Severity::Critical, Confidence::Low),
+            finding("a", "critical-high", Severity::Critical, Confidence::High),
+        ];
+        deduplicate_and_rank(&mut findings);
+        assert_eq!(
+            findings
+                .iter()
+                .map(|item| item.code.as_str())
+                .collect::<Vec<_>>(),
+            ["critical-high", "critical-low", "warning-low"]
+        );
+    }
+
+    #[test]
+    fn report_is_marked_incomplete_when_collection_had_errors() {
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let input = ObservationBundle {
+            target: resource("api-0"),
+            collected_from: now,
+            collected_at: now,
+            resources: vec![],
+            logs: vec![],
+            events: vec![],
+            health: vec![],
+            errors: vec![CollectionError {
+                resource: None,
+                source: ObservationSource::Events,
+                message: "unavailable".into(),
+                retryable: true,
+            }],
+        };
+        let report = DiagnosticEngine::default_rules().diagnose(&input);
+        assert!(report.incomplete);
+        assert_eq!(report.collection_errors.len(), 1);
+        assert_eq!(report.target, input.target);
+    }
 }

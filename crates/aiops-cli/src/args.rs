@@ -14,10 +14,19 @@ pub(crate) struct Cli {
 pub(crate) enum Command {
     /// Collect observations from a Kubernetes resource.
     Collect(CollectArgs),
+
+    /// Collect observations and diagnose a Kubernetes resource.
+    Diagnose(DiagnoseArgs),
 }
 
 #[derive(Debug, Args, PartialEq, Eq)]
 pub(crate) struct CollectArgs {
+    #[command(subcommand)]
+    pub resource: ResourceCommand,
+}
+
+#[derive(Debug, Args, PartialEq, Eq)]
+pub(crate) struct DiagnoseArgs {
     #[command(subcommand)]
     pub resource: ResourceCommand,
 }
@@ -134,12 +143,46 @@ mod tests {
 
         let Command::Collect(CollectArgs {
             resource: ResourceCommand::Pod(args),
-        }) = cli.command;
+        }) = cli.command
+        else {
+            panic!("expected collect pod command");
+        };
         assert_eq!(args.namespace, "production");
         assert_eq!(args.lookback, Duration::from_secs(2 * 60 * 60));
         assert_eq!(args.tail_lines, 100);
         assert!(args.no_logs);
         assert!(args.no_previous_logs);
+        assert!(args.no_events);
+    }
+
+    #[test]
+    fn parses_diagnose_pod_with_collection_options() {
+        let cli = Cli::try_parse_from([
+            "aiops",
+            "diagnose",
+            "pod",
+            "api-0",
+            "--namespace",
+            "production",
+            "--lookback",
+            "30m",
+            "--tail-lines",
+            "200",
+            "--no-events",
+        ])
+        .unwrap();
+
+        let Command::Diagnose(DiagnoseArgs {
+            resource: ResourceCommand::Pod(args),
+        }) = cli.command
+        else {
+            panic!("expected diagnose pod command");
+        };
+
+        assert_eq!(args.name, "api-0");
+        assert_eq!(args.namespace, "production");
+        assert_eq!(args.lookback, Duration::from_secs(30 * 60));
+        assert_eq!(args.tail_lines, 200);
         assert!(args.no_events);
     }
 

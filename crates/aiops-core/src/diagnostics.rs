@@ -1,7 +1,10 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{observations::{ObservationBundle, ObservationSource}, resources::ResourceRef};
+use crate::{
+    observations::{CollectionError, ObservationBundle, ObservationSource},
+    resources::ResourceRef,
+};
 
 pub trait DiagnosticRule: Send + Sync {
     fn evaluate(&self, bundle: &ObservationBundle) -> Vec<Finding>;
@@ -25,6 +28,7 @@ pub struct DiagnosisReport {
     pub generated_at: DateTime<Utc>,
     pub findings: Vec<Finding>,
     pub incomplete: bool,
+    pub collection_errors: Vec<CollectionError>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

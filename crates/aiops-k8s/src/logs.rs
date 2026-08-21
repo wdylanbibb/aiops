@@ -64,3 +64,47 @@ fn parse_line(
         previous_container: previous,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aiops_core::resources::ResourceKind;
+
+    fn resource() -> ResourceRef {
+        ResourceRef {
+            kind: ResourceKind::Pod,
+            namespace: Some("default".into()),
+            name: "api-0".into(),
+            uid: Some("pod-uid".into()),
+        }
+    }
+
+    #[test]
+    fn parses_rfc3339_timestamp_and_preserves_log_metadata() {
+        let entry = parse_line(
+            resource(),
+            Some("api"),
+            true,
+            "2026-01-02T03:04:05.123456789Z request completed",
+        );
+
+        assert_eq!(
+            entry.timestamp.unwrap().to_rfc3339(),
+            "2026-01-02T03:04:05.123456789+00:00"
+        );
+        assert_eq!(entry.message, "request completed");
+        assert_eq!(entry.container.as_deref(), Some("api"));
+        assert!(entry.previous_container);
+        assert_eq!(entry.stream, LogStream::Unknown);
+    }
+
+    #[test]
+    fn leaves_lines_without_valid_timestamp_untouched() {
+        let entry = parse_line(resource(), None, false, "not-a-time original message");
+
+        assert!(entry.timestamp.is_none());
+        assert_eq!(entry.message, "not-a-time original message");
+        assert!(entry.container.is_none());
+        assert!(!entry.previous_container);
+    }
+}
