@@ -1,6 +1,11 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::resources::ResourceRef;
+use crate::{observations::{ObservationBundle, ObservationSource}, resources::ResourceRef};
+
+pub trait DiagnosticRule: Send + Sync {
+    fn evaluate(&self, bundle: &ObservationBundle) -> Vec<Finding>;
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiagnosticFinding {
@@ -12,6 +17,48 @@ pub struct DiagnosticFinding {
     pub subject: ResourceRef,
     pub evidence_ids: Vec<String>,
     pub contributing_resources: Vec<ResourceRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiagnosisReport {
+    pub target: ResourceRef,
+    pub generated_at: DateTime<Utc>,
+    pub findings: Vec<Finding>,
+    pub incomplete: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Finding {
+    pub code: String,
+    pub severity: Severity,
+    pub confidence: Confidence,
+    pub subject: ResourceRef,
+    pub container: Option<String>,
+    pub title: String,
+    pub explanation: String,
+    pub evidence: Vec<Evidence>,
+    pub recommendations: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum Severity {
+    Info,
+    Warning,
+    Critical,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Confidence {
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Evidence {
+    pub source: ObservationSource,
+    pub summary: String,
+    pub timestamp: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,17 +74,4 @@ pub enum FindingCategory {
     Rollout,
     Dependency,
     Unknown,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct Confidence(f32);
-
-impl Confidence {
-    pub fn new(value: f32) -> Option<Self> {
-        (0.0..=1.0).contains(&value).then_some(Self(value))
-    }
-
-    pub fn value(self) -> f32 {
-        self.0
-    }
 }

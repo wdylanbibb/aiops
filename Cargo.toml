@@ -3,7 +3,8 @@ resolver = "2"
 members = [
   "crates/aiops-core",
   "crates/aiops-k8s",
-  "crates/aiops-cli"
+  "crates/aiops-cli",
+  "crates/aiops-diagnostics",
 ]
 
 [workspace.package]
@@ -18,6 +19,7 @@ publish = false
 [workspace.dependencies]
 aiops-core = { path = "crates/aiops-core" }
 aiops-k8s = { path = "crates/aiops-k8s" }
+aiops-diagnostics = { path = "crates/aiops-diagnostics" }
 
 anyhow = "1.0.103"
 chrono = { version = "0.4.45", features = ["serde"] }

@@ -29,8 +29,10 @@ name = "aiops-cli"
 version = "0.1.0"
 dependencies = [
  "aiops-core",
+ "aiops-diagnostics",
  "aiops-k8s",
  "anyhow",
+ "chrono",
  "clap",
  "serde_json",
  "tokio",
@@ -42,6 +44,16 @@ dependencies = [
 name = "aiops-core"
 version = "0.1.0"
 dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "aiops-diagnostics"
+version = "0.1.0"
+dependencies = [
+ "aiops-core",
  "chrono",
  "serde",
  "serde_json",
