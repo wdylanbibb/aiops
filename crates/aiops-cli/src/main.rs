@@ -36,7 +36,7 @@ async fn collect_pod(args: PodArgs) -> anyhow::Result<()> {
 
 async fn diagnose_pod(args: PodArgs) -> anyhow::Result<()> {
     let bundle = collect_pod_observations(&args).await?;
-    let report = DiagnosticEngine::default_rules().diagnose(&bundle);
+    let report = DiagnosticEngine::default_rules().diagnose(bundle);
     write_json(&report).context("failed to write diagnosis report")
 }
 

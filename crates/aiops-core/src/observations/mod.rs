@@ -8,12 +8,14 @@ pub use crate::observations::{
         HealthState,
     },
     logs::{LogEntry, LogStream},
+    workloads::{WorkloadObservation},
 };
-use crate::resources::{ResourceRef, ResourceSnapshot};
+use crate::resources::{ResourceRef, ResourceRelationship, ResourceSnapshot};
 
 mod events;
 mod health;
 mod logs;
+mod workloads;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObservationBundle {
@@ -21,6 +23,8 @@ pub struct ObservationBundle {
     pub collected_from: DateTime<Utc>,
     pub collected_at: DateTime<Utc>,
     pub resources: Vec<ResourceSnapshot>,
+    pub relationships: Vec<ResourceRelationship>,
+    pub workloads: Vec<WorkloadObservation>,
     pub logs: Vec<LogEntry>,
     pub events: Vec<ResourceEvent>,
     pub health: Vec<HealthObservation>,

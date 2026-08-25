@@ -39,6 +39,18 @@ pub struct ResourceSnapshot {
     pub conditions: Vec<ResourceCondition>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceRelationship {
+    pub kind: RelationshipKind,
+    pub owner: ResourceRef,
+    pub dependent: ResourceRef,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RelationshipKind {
+    ControllerOwner,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ResourceMetadata {
     pub labels: BTreeMap<String, String>,

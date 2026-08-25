@@ -612,6 +612,8 @@ mod tests {
             collected_from: at(),
             collected_at: at(),
             resources: vec![],
+            relationships: vec![],
+            workloads: vec![],
             logs: vec![],
             events: vec![],
             health: vec![],

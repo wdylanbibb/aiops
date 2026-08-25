@@ -1,9 +1,10 @@
 use aiops_core::{
-    diagnostics::{Confidence, DiagnosisReport, DiagnosticRule, Finding, Severity},
+    diagnostics::{Confidence, DiagnosticRule, Finding, Incident, IncidentStatus, Severity},
     observations::ObservationBundle,
     resources::ResourceRef,
 };
 use chrono::Utc;
+use uuid::Uuid;
 use std::{cmp::Ordering, collections::HashMap};
 
 use crate::rules::{ContainerRestartRule, LogPatternRule, PodNotReadyRule, WarningEventRule};
@@ -24,21 +25,36 @@ impl DiagnosticEngine {
         }
     }
 
-    pub fn diagnose(&self, bundle: &ObservationBundle) -> DiagnosisReport {
+    pub fn diagnose(&self, observations: ObservationBundle) -> Incident {
+        let created_at = Utc::now();
+
         let mut findings = self
             .rules
             .iter()
-            .flat_map(|rule| rule.evaluate(bundle))
+            .flat_map(|rule| rule.evaluate(&observations))
             .collect::<Vec<_>>();
 
         deduplicate_and_rank(&mut findings);
 
-        DiagnosisReport {
-            target: bundle.target.clone(),
-            generated_at: Utc::now(),
+        let severity = findings.iter().map(|finding| finding.severity).max_by_key(severity_rank).unwrap_or(Severity::Info);
+
+        let status = if !observations.errors.is_empty() {
+            IncidentStatus::Incomplete
+        } else if findings.iter().any(|finding| finding.severity != Severity::Info) {
+            IncidentStatus::Open
+        } else {
+            IncidentStatus::Resolved
+        };
+
+        Incident {
+            id: Uuid::now_v7(),
+            status,
+            severity,
+            target: observations.target.clone(),
+            created_at,
+            updated_at: Utc::now(),
+            observations,
             findings,
-            incomplete: !bundle.errors.is_empty(),
-            collection_errors: bundle.errors.clone(),
         }
     }
 }
@@ -146,7 +162,7 @@ fn compare_findings(left: &Finding, right: &Finding) -> Ordering {
 mod tests {
     use super::*;
     use aiops_core::{
-        diagnostics::Evidence,
+        diagnostics::{Evidence, IncidentStatus},
         observations::{CollectionError, ObservationSource},
         resources::ResourceKind,
     };
@@ -237,6 +253,8 @@ mod tests {
             collected_from: now,
             collected_at: now,
             resources: vec![],
+            relationships: vec![],
+            workloads: vec![],
             logs: vec![],
             events: vec![],
             health: vec![],
@@ -247,9 +265,9 @@ mod tests {
                 retryable: true,
             }],
         };
-        let report = DiagnosticEngine::default_rules().diagnose(&input);
-        assert!(report.incomplete);
-        assert_eq!(report.collection_errors.len(), 1);
+        let report = DiagnosticEngine::default_rules().diagnose(input.clone());
+        assert_eq!(report.status, IncidentStatus::Incomplete);
+        assert_eq!(report.observations.errors.len(), 1);
         assert_eq!(report.target, input.target);
     }
 }

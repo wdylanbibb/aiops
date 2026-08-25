@@ -2,16 +2,17 @@ use aiops_core::{
     observations::{
         CollectionError, ContainerHealth, ObservationBundle, ObservationSource, ResourceEvent,
     },
-    resources::ResourceRef,
+    resources::{RelationshipKind, ResourceRef, ResourceRelationship},
 };
 use chrono::{DateTime, Duration, Utc};
-use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::{api::core::v1::Pod, apimachinery::pkg::apis::meta::v1::OwnerReference};
+use kube::{ResourceExt, api::ObjectMeta};
 
 use crate::{
     client::KubernetesClient,
     events,
     logs::{self, PodLogRequest},
-    pods,
+    pods, workloads,
 };
 
 #[derive(Debug, Clone)]
@@ -65,11 +66,16 @@ impl KubernetesCollector {
             collected_from: collected_at - self.options.lookback,
             collected_at,
             resources: vec![snapshot],
+            relationships: Vec::new(),
+            workloads: Vec::new(),
             logs: Vec::new(),
             events: Vec::new(),
             health: vec![health],
             errors: Vec::new(),
         };
+
+        self.collect_pod_owner_chain(namespace, &pod, &mut bundle)
+            .await;
 
         if self.options.include_events {
             match events::collect(self.client.inner(), &target).await {
@@ -94,6 +100,95 @@ impl KubernetesCollector {
         }
 
         Ok(bundle)
+    }
+
+    async fn collect_pod_owner_chain(
+        &self,
+        namespace: &str,
+        pod: &Pod,
+        bundle: &mut ObservationBundle,
+    ) {
+        let pod_ref = pods::snapshot(pod).resource;
+
+        let Some(replica_set_owner) =
+            controller_owner(&pod.metadata).filter(|owner| owner.kind == "ReplicaSet")
+        else {
+            return;
+        };
+
+        let replica_set = match workloads::get_replica_set(
+            self.client.inner(),
+            namespace,
+            &replica_set_owner.name,
+        )
+        .await
+        {
+            Ok(replica_set) => replica_set,
+            Err(error) => {
+                push_owner_error(bundle, &pod_ref, replica_set_owner, error);
+                return;
+            }
+        };
+
+        // Owner deleted and recreated with the same name
+        if replica_set.uid().as_deref() != Some(replica_set_owner.uid.as_str()) {
+            push_uid_mismatch(bundle, &pod_ref, replica_set_owner);
+            return;
+        }
+
+        let replica_set_ref = workloads::replica_set_snapshot(&replica_set)
+            .resource
+            .clone();
+
+        bundle.relationships.push(ResourceRelationship {
+            kind: RelationshipKind::ControllerOwner,
+            owner: replica_set_ref.clone(),
+            dependent: pod_ref,
+        });
+
+        bundle
+            .resources
+            .push(workloads::replica_set_snapshot(&replica_set));
+
+        bundle
+            .workloads
+            .push(workloads::replica_set_observation(&replica_set));
+
+        let Some(deployment_owner) =
+            controller_owner(&replica_set.metadata).filter(|owner| owner.kind == "Deployment")
+        else {
+            return;
+        };
+
+        let deployment =
+            match workloads::get_deployment(self.client.inner(), namespace, &deployment_owner.name)
+                .await
+            {
+                Ok(deployment) => deployment,
+                Err(error) => {
+                    push_owner_error(bundle, &replica_set_ref, deployment_owner, error);
+                    return;
+                }
+            };
+
+        if deployment.uid().as_deref() != Some(deployment_owner.uid.as_str()) {
+            push_uid_mismatch(bundle, &replica_set_ref, deployment_owner);
+            return;
+        }
+
+        let deployment_snapshot = workloads::deployment_snapshot(&deployment);
+        let deployment_ref = deployment_snapshot.resource.clone();
+
+        bundle.relationships.push(ResourceRelationship {
+            kind: RelationshipKind::ControllerOwner,
+            owner: deployment_ref,
+            dependent: replica_set_ref,
+        });
+
+        bundle.resources.push(deployment_snapshot);
+        bundle
+            .workloads
+            .push(workloads::deployment_observation(&deployment));
     }
 
     async fn collect_container_logs(
@@ -168,6 +263,48 @@ impl KubernetesCollector {
             }
         }
     }
+}
+
+fn push_owner_error(
+    bundle: &mut ObservationBundle,
+    dependent: &ResourceRef,
+    owner: &OwnerReference,
+    error: kube::Error,
+) {
+    bundle.errors.push(CollectionError {
+        resource: Some(dependent.clone()),
+        source: ObservationSource::ResourceState,
+        message: format!(
+            "failed to collect owner {} {}: {error}",
+            owner.kind, owner.name
+        ),
+        retryable: is_retryable(&error),
+    });
+}
+
+fn push_uid_mismatch(
+    bundle: &mut ObservationBundle,
+    dependent: &ResourceRef,
+    owner: &OwnerReference,
+) {
+    bundle.errors.push(CollectionError {
+        resource: Some(dependent.clone()),
+        source: ObservationSource::ResourceState,
+        message: format!(
+            "{} {} was recreated and no longer matches owner UID {}",
+            owner.kind, owner.name, owner.uid
+        ),
+        retryable: false,
+    });
+}
+
+fn controller_owner(metadata: &ObjectMeta) -> Option<&OwnerReference> {
+    metadata
+        .owner_references
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .find(|owner| owner.controller == Some(true))
 }
 
 fn event_within_window(event: &ResourceEvent, cutoff: DateTime<Utc>) -> bool {

@@ -1,8 +1,9 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::{
-    observations::{CollectionError, ObservationBundle, ObservationSource},
+    observations::{ObservationBundle, ObservationSource},
     resources::ResourceRef,
 };
 
@@ -23,12 +24,22 @@ pub struct DiagnosticFinding {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DiagnosisReport {
+pub struct Incident {
+    pub id: Uuid,
+    pub status: IncidentStatus,
+    pub severity: Severity,
     pub target: ResourceRef,
-    pub generated_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub observations: ObservationBundle,
     pub findings: Vec<Finding>,
-    pub incomplete: bool,
-    pub collection_errors: Vec<CollectionError>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IncidentStatus {
+    Open,
+    Resolved,
+    Incomplete,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,7 +55,7 @@ pub struct Finding {
     pub recommendations: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Severity {
     Info,
     Warning,
