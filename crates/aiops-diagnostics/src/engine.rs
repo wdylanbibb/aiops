@@ -1,10 +1,8 @@
 use aiops_core::{
-    diagnostics::{Confidence, DiagnosticRule, Finding, Incident, IncidentStatus, Severity},
+    diagnostics::{Confidence, DiagnosticRule, Finding, Incident, Severity},
     observations::ObservationBundle,
     resources::ResourceRef,
 };
-use chrono::Utc;
-use uuid::Uuid;
 use std::{cmp::Ordering, collections::HashMap};
 
 use crate::rules::{ContainerRestartRule, LogPatternRule, PodNotReadyRule, WarningEventRule, WorkloadGenerationRule, WorkloadNoOwnedPodsRule, WorkloadReplicaAvailabilityRule, WorkloadRolloutStalledRule};
@@ -30,8 +28,6 @@ impl DiagnosticEngine {
     }
 
     pub fn diagnose(&self, observations: ObservationBundle) -> Incident {
-        let created_at = Utc::now();
-
         let mut findings = self
             .rules
             .iter()
@@ -40,26 +36,7 @@ impl DiagnosticEngine {
 
         deduplicate_and_rank(&mut findings);
 
-        let severity = findings.iter().map(|finding| finding.severity).max_by_key(severity_rank).unwrap_or(Severity::Info);
-
-        let status = if !observations.errors.is_empty() {
-            IncidentStatus::Incomplete
-        } else if findings.iter().any(|finding| finding.severity != Severity::Info) {
-            IncidentStatus::Open
-        } else {
-            IncidentStatus::Resolved
-        };
-
-        Incident {
-            id: Uuid::now_v7(),
-            status,
-            severity,
-            target: observations.target.clone(),
-            created_at,
-            updated_at: Utc::now(),
-            observations,
-            findings,
-        }
+        Incident::new(observations, findings)
     }
 }
 

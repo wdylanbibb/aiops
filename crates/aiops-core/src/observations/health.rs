@@ -15,7 +15,8 @@ pub struct HealthObservation {
     pub containers: Vec<ContainerHealth>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum HealthState {
     Healthy,
     Degraded,
@@ -36,6 +37,7 @@ pub struct ContainerHealth {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ContainerKind {
     Init,
     Application,
@@ -43,6 +45,7 @@ pub enum ContainerKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ContainerState {
     Running {
         started_at: Option<DateTime<Utc>>,

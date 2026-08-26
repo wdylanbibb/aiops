@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    observations::{ObservationBundle, ObservationSource},
+    observations::{self, ObservationBundle, ObservationSource},
     resources::ResourceRef,
 };
 
@@ -11,18 +11,7 @@ pub trait DiagnosticRule: Send + Sync {
     fn evaluate(&self, bundle: &ObservationBundle) -> Vec<Finding>;
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DiagnosticFinding {
-    pub id: String,
-    pub category: FindingCategory,
-    pub title: String,
-    pub explanation: String,
-    pub confidence: Confidence,
-    pub subject: ResourceRef,
-    pub evidence_ids: Vec<String>,
-    pub contributing_resources: Vec<ResourceRef>,
-}
-
+#[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Incident {
     pub id: Uuid,
@@ -35,7 +24,44 @@ pub struct Incident {
     pub findings: Vec<Finding>,
 }
 
+impl Incident {
+    pub fn new(observations: ObservationBundle, findings: Vec<Finding>) -> Self {
+        let now = Utc::now();
+
+        let severity = findings
+            .iter()
+            .map(|finding| finding.severity)
+            .max()
+            .unwrap_or(Severity::Info);
+
+        let status = if !observations.errors.is_empty() {
+            IncidentStatus::Incomplete
+        } else if findings.iter().any(|finding| {
+            matches!(
+                finding.severity,
+                Severity::Warning | Severity::Critical
+            )
+        }) {
+            IncidentStatus::Open
+        } else {
+            IncidentStatus::Resolved
+        };
+
+        Self {
+            id: Uuid::now_v7(),
+            status,
+            severity,
+            target: observations.target.clone(),
+            created_at: now,
+            updated_at: now,
+            observations,
+            findings,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum IncidentStatus {
     Open,
     Resolved,
@@ -55,14 +81,16 @@ pub struct Finding {
     pub recommendations: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Severity {
     Info,
     Warning,
     Critical,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Confidence {
     Low,
     Medium,

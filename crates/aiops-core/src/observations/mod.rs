@@ -8,7 +8,7 @@ pub use crate::observations::{
         HealthState,
     },
     logs::{LogEntry, LogStream},
-    workloads::{WorkloadObservation},
+    workloads::WorkloadObservation,
 };
 use crate::resources::{ResourceRef, ResourceRelationship, ResourceSnapshot};
 
@@ -23,8 +23,13 @@ pub struct ObservationBundle {
     pub collected_from: DateTime<Utc>,
     pub collected_at: DateTime<Utc>,
     pub resources: Vec<ResourceSnapshot>,
+
+    #[serde(default)]
     pub relationships: Vec<ResourceRelationship>,
+
+    #[serde(default)]
     pub workloads: Vec<WorkloadObservation>,
+
     pub logs: Vec<LogEntry>,
     pub events: Vec<ResourceEvent>,
     pub health: Vec<HealthObservation>,
@@ -40,6 +45,7 @@ pub struct CollectionError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ObservationSource {
     ResourceState,
     Logs,
