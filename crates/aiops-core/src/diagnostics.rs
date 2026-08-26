@@ -36,12 +36,10 @@ impl Incident {
 
         let status = if !observations.errors.is_empty() {
             IncidentStatus::Incomplete
-        } else if findings.iter().any(|finding| {
-            matches!(
-                finding.severity,
-                Severity::Warning | Severity::Critical
-            )
-        }) {
+        } else if findings
+            .iter()
+            .any(|finding| matches!(finding.severity, Severity::Warning | Severity::Critical))
+        {
             IncidentStatus::Open
         } else {
             IncidentStatus::Resolved

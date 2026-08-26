@@ -5,7 +5,11 @@ use aiops_core::{
 };
 use std::{cmp::Ordering, collections::HashMap};
 
-use crate::rules::{ContainerRestartRule, LogPatternRule, PodNotReadyRule, WarningEventRule, WorkloadGenerationRule, WorkloadNoOwnedPodsRule, WorkloadReplicaAvailabilityRule, WorkloadRolloutStalledRule};
+use crate::rules::{
+    ContainerRestartRule, LogPatternRule, PodNotReadyRule, WarningEventRule,
+    WorkloadGenerationRule, WorkloadNoOwnedPodsRule, WorkloadReplicaAvailabilityRule,
+    WorkloadRolloutStalledRule,
+};
 
 pub struct DiagnosticEngine {
     rules: Vec<Box<dyn DiagnosticRule>>,
