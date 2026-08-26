@@ -7,7 +7,7 @@ use chrono::Utc;
 use uuid::Uuid;
 use std::{cmp::Ordering, collections::HashMap};
 
-use crate::rules::{ContainerRestartRule, LogPatternRule, PodNotReadyRule, WarningEventRule};
+use crate::rules::{ContainerRestartRule, LogPatternRule, PodNotReadyRule, WarningEventRule, WorkloadGenerationRule, WorkloadNoOwnedPodsRule, WorkloadReplicaAvailabilityRule, WorkloadRolloutStalledRule};
 
 pub struct DiagnosticEngine {
     rules: Vec<Box<dyn DiagnosticRule>>,
@@ -17,6 +17,10 @@ impl DiagnosticEngine {
     pub fn default_rules() -> Self {
         Self {
             rules: vec![
+                Box::new(WorkloadRolloutStalledRule),
+                Box::new(WorkloadReplicaAvailabilityRule),
+                Box::new(WorkloadGenerationRule),
+                Box::new(WorkloadNoOwnedPodsRule),
                 Box::new(PodNotReadyRule),
                 Box::new(ContainerRestartRule),
                 Box::new(WarningEventRule),

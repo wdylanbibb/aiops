@@ -1,12 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use aiops_core::{
     diagnostics::{Confidence, DiagnosticRule, Evidence, Finding, Severity},
     observations::{
         ContainerHealth, ContainerState, ContainerTermination, EventType, HealthState, LogEntry,
-        ObservationSource,
+        ObservationBundle, ObservationSource, WorkloadObservation,
     },
-    resources::{ConditionStatus, ResourceRef},
+    resources::{ConditionStatus, RelationshipKind, ResourceKind, ResourceRef},
 };
 use chrono::{DateTime, Utc};
 
@@ -422,6 +422,234 @@ impl DiagnosticRule for LogPatternRule {
             })
             .collect()
     }
+}
+
+pub struct WorkloadReplicaAvailabilityRule;
+
+impl DiagnosticRule for WorkloadReplicaAvailabilityRule {
+    fn evaluate(&self, bundle: &aiops_core::observations::ObservationBundle) -> Vec<Finding> {
+        bundle
+            .workloads
+            .iter()
+            .filter(|workload| {
+                workload.desired_replicas > 0 && workload.ready_replicas < workload.desired_replicas
+            })
+            .map(|workload| {
+                let severity = if workload.ready_replicas == 0 {
+                    Severity::Critical
+                } else {
+                    Severity::Warning
+                };
+
+                Finding {
+                    code: "workload.replicas_unavailable".into(),
+                    severity,
+                    confidence: Confidence::High,
+                    subject: workload.resource.clone(),
+                    container: None,
+                    title: format!("{} has unavailable replicas", workload.resource.name),
+                    explanation: format!(
+                        "{} of {} desired replicas are ready.",
+                        workload.ready_replicas, workload.desired_replicas,
+                    ),
+                    evidence: vec![replica_evidence(workload)],
+                    recommendations: vec![
+                        "Inspect the health and events of the workload's owned pods.".into(),
+                        "Inspect rollout conditions and recent workload changes.".into(),
+                    ],
+                }
+            })
+            .collect()
+    }
+}
+
+fn replica_evidence(workload: &WorkloadObservation) -> Evidence {
+    Evidence {
+        source: ObservationSource::ResourceState,
+        summary: format!(
+            "desired={}, current={}, ready={}, available={}",
+            workload.desired_replicas,
+            workload.current_replicas,
+            workload.ready_replicas,
+            workload
+                .available_replicas
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".into()),
+        ),
+        timestamp: Some(workload.observed_at),
+    }
+}
+
+pub struct WorkloadRolloutStalledRule;
+
+impl DiagnosticRule for WorkloadRolloutStalledRule {
+    fn evaluate(&self, bundle: &aiops_core::observations::ObservationBundle) -> Vec<Finding> {
+        bundle
+            .workloads
+            .iter()
+            .filter(|workload| workload.resource.kind == ResourceKind::Deployment)
+            .filter_map(|workload| {
+                let condition = workload.conditions.iter().find(|condition| {
+                    condition.condition_type == "Progressing"
+                        && condition.status == ConditionStatus::False
+                        && condition.reason.as_deref() == Some("ProgressDeadlineExceeded")
+                })?;
+
+                let detail = condition
+                    .message
+                    .as_deref()
+                    .or(condition.reason.as_deref())
+                    .unwrap_or("the rollout exceeded its progress deadline");
+
+                Some(Finding {
+                    code: "workload.rollout_stalled".into(),
+                    severity: Severity::Critical,
+                    confidence: Confidence::High,
+                    subject: workload.resource.clone(),
+                    container: None,
+                    title: format!("Deployment {} rollout is stalled", workload.resource.name),
+                    explanation: detail.to_owned(),
+                    evidence: vec![Evidence {
+                        source: ObservationSource::ResourceState,
+                        summary: format!(
+                            "Progressing=False, reason={}",
+                            condition.reason.as_deref().unwrap_or("unknown"),
+                        ),
+                        timestamp: Some(workload.observed_at),
+                    }],
+                    recommendations: vec![
+                        "Inspect unavailable pods and their container states.".into(),
+                        "Review the Deployment's rollout history and latest template changes."
+                            .into(),
+                        "Verify image, scheduling, probe, and configuration events.".into(),
+                    ],
+                })
+            })
+            .collect()
+    }
+}
+
+pub struct WorkloadGenerationRule;
+
+impl DiagnosticRule for WorkloadGenerationRule {
+    fn evaluate(&self, bundle: &aiops_core::observations::ObservationBundle) -> Vec<Finding> {
+        bundle
+            .resources
+            .iter()
+            .filter(|snapshot| {
+                matches!(
+                &snapshot.resource.kind,
+                    ResourceKind::Deployment | ResourceKind::ReplicaSet
+            )
+            })
+            .filter_map(|snapshot| {
+                let generation = snapshot.metadata.generation?;
+                let observed = snapshot.metadata.observed_generation?;
+
+                if observed > generation {
+                    return None;
+                }
+
+                Some(Finding {
+                    code: "workload.generation_unobserved".into(),
+                    severity: Severity::Warning,
+                    confidence: Confidence::Medium,
+                    subject: snapshot.resource.clone(),
+                    container: None,
+                    title: format!(
+                        "{} has not observed its latest generation",
+                        snapshot.resource.name
+                    ),
+                    explanation: format!(
+                        "Resource generation is {generation}, but the controller has observed generation {observed}.",
+                    ),
+                    evidence: vec![Evidence {
+                        source: ObservationSource::ResourceState,
+                        summary: format!(
+                            "generation={generation}, observed_generation={observed}",
+                        ),
+                        timestamp: Some(snapshot.observed_at),
+                    }],
+                    recommendations: vec![
+                        "Check the controller manager and recent resource events.".into(),
+                        "Verify that the workload specification is valid and can be reconciled.".into()
+                    ],
+                })
+            })
+            .collect()
+    }
+}
+
+pub struct WorkloadNoOwnedPodsRule;
+
+impl DiagnosticRule for WorkloadNoOwnedPodsRule {
+    fn evaluate(&self, bundle: &aiops_core::observations::ObservationBundle) -> Vec<Finding> {
+        // Avoid claiming there are no pods when topology collection failed
+        if bundle
+            .errors
+            .iter()
+            .any(|error| error.source == ObservationSource::ResourceState)
+        {
+            return Vec::new();
+        }
+
+        bundle
+            .workloads
+            .iter()
+            .filter(|workload| workload.desired_replicas > 0)
+            .filter(|workload| !has_reachable_pod(bundle, &workload.resource))
+            .map(|workload| Finding {
+                code: "workload.no_owned_pods".into(),
+                severity: Severity::Critical,
+                confidence: Confidence::High,
+                subject: workload.resource.clone(),
+                container: None,
+                title: format!(
+                    "{} has no owned pods",
+                    workload.resource.name,
+                ),
+                explanation: format!(
+                    "The workload desires {} replica(s), but no owned pods were found.",
+                    workload.desired_replicas,
+                ),
+                evidence: vec![Evidence {
+                    source: ObservationSource::ResourceState,
+                    summary: format!(
+                        "desired_replicas={}, reachable_pods=0",
+                        workload.desired_replicas,
+                    ),
+                    timestamp: Some(workload.observed_at),
+                }],
+                recommendations: vec![
+                    "Inspect workload and ReplicaSet events for pod creation failures.".into(),
+                    "Verify quotas, admission policies, service accounts, and pod template configuration.".into(),
+                ],
+            })
+            .collect()
+    }
+}
+
+fn has_reachable_pod(bundle: &ObservationBundle, root: &ResourceRef) -> bool {
+    let mut pending = vec![root.clone()];
+    let mut visited = HashSet::new();
+
+    while let Some(resource) = pending.pop() {
+        if !visited.insert(resource.clone()) {
+            continue;
+        }
+
+        for relationship in bundle.relationships.iter().filter(|relationship| {
+            relationship.kind == RelationshipKind::ControllerOwner && relationship.owner == resource
+        }) {
+            if relationship.dependent.kind == ResourceKind::Pod {
+                return true;
+            }
+
+            pending.push(relationship.dependent.clone());
+        }
+    }
+
+    false
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
