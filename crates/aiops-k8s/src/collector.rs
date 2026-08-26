@@ -2,8 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use aiops_core::{
     observations::{
-        CollectionError, HealthState, ObservationBundle, ObservationSource,
-        ResourceEvent,
+        CollectionError, HealthState, ObservationBundle, ObservationSource, ResourceEvent,
     },
     resources::{RelationshipKind, ResourceRef, ResourceRelationship},
 };
@@ -140,13 +139,12 @@ impl KubernetesCollector {
         };
 
         let deployment_ref = deployment.as_ref().map(|deployment| {
-            let snapshot = workloads::deployment_snapshot(deployment);
-            let resource = snapshot.resource.clone();
+            let converted = workloads::convert_deployment(deployment);
 
-            bundle.resources.push(snapshot);
-            bundle
-                .workloads
-                .push(workloads::deployment_observation(deployment));
+            let resource = converted.snapshot.resource.clone();
+
+            bundle.resources.push(converted.snapshot);
+            bundle.workloads.push(converted.observation);
 
             resource
         });
@@ -154,8 +152,8 @@ impl KubernetesCollector {
         let mut replica_set_refs = HashMap::<String, ResourceRef>::new();
 
         for replica_set in &replica_sets {
-            let snapshot = workloads::replica_set_snapshot(replica_set);
-            let replica_set_ref = snapshot.resource.clone();
+            let converted = workloads::convert_replica_set(replica_set);
+            let replica_set_ref = converted.snapshot.resource.clone();
 
             if let Some(uid) = replica_set.uid() {
                 replica_set_refs.insert(uid, replica_set_ref.clone());
@@ -178,10 +176,8 @@ impl KubernetesCollector {
                 }
             }
 
-            bundle.resources.push(snapshot);
-            bundle
-                .workloads
-                .push(workloads::replica_set_observation(replica_set));
+            bundle.resources.push(converted.snapshot);
+            bundle.workloads.push(converted.observation);
         }
 
         for pod in &collected_pods {
@@ -463,7 +459,7 @@ impl KubernetesCollector {
                 topology.deployment = Some(deployment);
             }
             Ok(ParentDeployment::UidMismatch { expected, actual }) => {
-                let replica_set_ref = workloads::replica_set_snapshot(&replica_set).resource;
+                let replica_set_ref = workloads::replica_set_ref(&replica_set);
 
                 topology.errors.push(CollectionError {
                     resource: Some(replica_set_ref),
@@ -478,7 +474,7 @@ impl KubernetesCollector {
             }
             Ok(ParentDeployment::None) => {}
             Err(error) => {
-                let replica_set_ref = workloads::replica_set_snapshot(&replica_set).resource;
+                let replica_set_ref = workloads::replica_set_ref(&replica_set);
 
                 topology.errors.push(CollectionError {
                     resource: Some(replica_set_ref),
@@ -504,9 +500,7 @@ impl KubernetesCollector {
     ) -> Result<CollectedTopology, kube::Error> {
         let replica_set = workloads::get_replica_set(self.client.inner(), namespace, name).await?;
 
-        let target = workloads::replica_set_snapshot(&replica_set)
-            .resource
-            .clone();
+        let target = workloads::replica_set_ref(&replica_set);
 
         let mut errors = Vec::new();
 
@@ -584,7 +578,7 @@ impl KubernetesCollector {
     ) -> Result<CollectedTopology, kube::Error> {
         let deployment = workloads::get_deployment(self.client.inner(), namespace, name).await?;
 
-        let target = workloads::deployment_snapshot(&deployment).resource.clone();
+        let target = workloads::deployment_ref(&deployment);
 
         let mut errors = Vec::new();
 
@@ -695,7 +689,7 @@ fn missing_log_metadata_error(resource: &ResourceRef, field: &str) -> Collection
         message: format!(
             "pod {namespace}/{name} has no metadata.{field}; logs cannot be collected"
         ),
-        retryable: false
+        retryable: false,
     }
 }
 

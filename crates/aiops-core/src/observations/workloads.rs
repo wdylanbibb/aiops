@@ -11,5 +11,6 @@ pub struct WorkloadObservation {
     pub current_replicas: u32,
     pub ready_replicas: u32,
     pub available_replicas: Option<u32>,
+    pub updated_replicas: Option<u32>,
     pub conditions: Vec<ResourceCondition>,
 }

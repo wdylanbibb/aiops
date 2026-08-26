@@ -2,22 +2,23 @@ use std::collections::HashSet;
 
 use aiops_core::{
     observations::WorkloadObservation,
-    resources::{ResourceCondition, ResourceKind, ResourceMetadata, ResourceSnapshot},
+    resources::{
+        ConditionStatus, ResourceCondition, ResourceKind, ResourceMetadata, ResourceRef,
+        ResourceSnapshot,
+    },
 };
 use chrono::{DateTime, Utc};
 use k8s_openapi::api::{
     apps::v1::{DaemonSet, Deployment, ReplicaSet, StatefulSet},
     core::v1::Pod,
 };
-use kube::{Api, Client, ResourceExt, api::ListParams, core::Selector};
+use kube::{
+    Api, Client, ResourceExt,
+    api::{ListParams, ObjectMeta},
+    core::Selector,
+};
 
 use crate::convert::resource_ref;
-
-pub struct Workloads {
-    pub deployments: Vec<Deployment>,
-    pub stateful_sets: Vec<StatefulSet>,
-    pub daemon_sets: Vec<DaemonSet>,
-}
 
 pub enum ParentDeployment {
     None,
@@ -25,38 +26,12 @@ pub enum ParentDeployment {
     UidMismatch {
         expected: String,
         actual: Option<String>,
-    }
+    },
 }
 
-pub async fn list(client: Client, namespace: Option<&str>) -> Result<Workloads, kube::Error> {
-    let deployments = match namespace {
-        Some(namespace) => Api::<Deployment>::namespaced(client.clone(), namespace),
-        None => Api::<Deployment>::all(client.clone()),
-    };
-
-    let stateful_sets = match namespace {
-        Some(namespace) => Api::<StatefulSet>::namespaced(client.clone(), namespace),
-        None => Api::<StatefulSet>::all(client.clone()),
-    };
-
-    let daemon_sets = match namespace {
-        Some(namespace) => Api::<DaemonSet>::namespaced(client.clone(), namespace),
-        None => Api::<DaemonSet>::all(client.clone()),
-    };
-
-    let params = ListParams::default();
-
-    let (deployments, stateful_sets, daemon_sets) = tokio::try_join!(
-        deployments.list(&params),
-        stateful_sets.list(&params),
-        daemon_sets.list(&params),
-    )?;
-
-    Ok(Workloads {
-        deployments: deployments.items,
-        stateful_sets: stateful_sets.items,
-        daemon_sets: daemon_sets.items,
-    })
+pub struct ConvertedWorkload {
+    pub snapshot: ResourceSnapshot,
+    pub observation: WorkloadObservation,
 }
 
 pub async fn get_replica_set(
@@ -79,94 +54,49 @@ pub async fn get_deployment(
         .await
 }
 
-pub fn replica_set_snapshot(replica_set: &ReplicaSet) -> ResourceSnapshot {
-    let metadata = &replica_set.metadata;
-
-    ResourceSnapshot {
-        resource: resource_ref(replica_set, ResourceKind::ReplicaSet),
-        observed_at: Utc::now(),
-        metadata: ResourceMetadata {
-            labels: metadata.labels.clone().unwrap_or_default(),
-            annotations: metadata.annotations.clone().unwrap_or_default(),
-            generation: metadata.generation,
-            observed_generation: replica_set
-                .status
-                .as_ref()
-                .and_then(|status| status.observed_generation),
-            deletion_timestamp: metadata.deletion_timestamp.as_ref().map(timestamp),
-        },
-        conditions: replica_set
-            .status
-            .as_ref()
-            .and_then(|status| status.conditions.as_ref())
-            .into_iter()
-            .flatten()
-            .map(|condition| ResourceCondition {
-                condition_type: condition.type_.clone(),
-                status: match condition.status.as_str() {
-                    "True" => aiops_core::resources::ConditionStatus::True,
-                    "False" => aiops_core::resources::ConditionStatus::False,
-                    _ => aiops_core::resources::ConditionStatus::Unknown,
-                },
-                reason: condition.reason.clone(),
-                message: condition.message.clone(),
-            })
-            .collect(),
-    }
+pub fn replica_set_ref(replica_set: &ReplicaSet) -> ResourceRef {
+    resource_ref(replica_set, ResourceKind::ReplicaSet)
 }
 
-pub fn deployment_snapshot(deployment: &Deployment) -> ResourceSnapshot {
-    let metadata = &deployment.metadata;
-
-    ResourceSnapshot {
-        resource: resource_ref(deployment, ResourceKind::Deployment),
-        observed_at: Utc::now(),
-        metadata: ResourceMetadata {
-            labels: metadata.labels.clone().unwrap_or_default(),
-            annotations: metadata.annotations.clone().unwrap_or_default(),
-            generation: metadata.generation,
-            observed_generation: deployment
-                .status
-                .as_ref()
-                .and_then(|status| status.observed_generation),
-            deletion_timestamp: metadata.deletion_timestamp.as_ref().map(timestamp),
-        },
-        conditions: deployment
-            .status
-            .as_ref()
-            .and_then(|status| status.conditions.as_ref())
-            .into_iter()
-            .flatten()
-            .map(|condition| ResourceCondition {
-                condition_type: condition.type_.clone(),
-                status: match condition.status.as_str() {
-                    "True" => aiops_core::resources::ConditionStatus::True,
-                    "False" => aiops_core::resources::ConditionStatus::False,
-                    _ => aiops_core::resources::ConditionStatus::Unknown,
-                },
-                reason: condition.reason.clone(),
-                message: condition.message.clone(),
-            })
-            .collect(),
-    }
+pub fn deployment_ref(deployment: &Deployment) -> ResourceRef {
+    resource_ref(deployment, ResourceKind::Deployment)
 }
 
-pub fn replica_set_observation(replica_set: &ReplicaSet) -> WorkloadObservation {
-    let snapshot = replica_set_snapshot(replica_set);
+pub fn convert_replica_set(replica_set: &ReplicaSet) -> ConvertedWorkload {
+    let observed_at = Utc::now();
+    let resource = replica_set_ref(replica_set);
     let status = replica_set.status.as_ref();
 
-    WorkloadObservation {
-        resource: snapshot.resource,
-        observed_at: snapshot.observed_at,
-        desired_replicas: replica_set
-            .spec
-            .as_ref()
-            .and_then(|spec| spec.replicas)
-            .map(non_negative)
-            .unwrap_or(1),
+    let conditions = status
+        .and_then(|status| status.conditions.as_deref())
+        .unwrap_or_default()
+        .iter()
+        .map(|condition| {
+            convert_condition(
+                &condition.type_,
+                &condition.status,
+                condition.reason.as_deref(),
+                condition.message.as_deref(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let snapshot = convert_snapshot(
+        &replica_set.metadata,
+        resource.clone(),
+        observed_at,
+        status.and_then(|status| status.observed_generation),
+        conditions.clone(),
+    );
+
+    let observation = WorkloadObservation {
+        resource,
+        observed_at,
+        desired_replicas: desired_replicas(
+            replica_set.spec.as_ref().and_then(|spec| spec.replicas),
+        ),
         current_replicas: status
-            .map(|status| status.replicas)
-            .map(non_negative)
+            .map(|status| non_negative(status.replicas))
             .unwrap_or(0),
         ready_replicas: status
             .and_then(|status| status.ready_replicas)
@@ -175,23 +105,47 @@ pub fn replica_set_observation(replica_set: &ReplicaSet) -> WorkloadObservation 
         available_replicas: status
             .and_then(|status| status.available_replicas)
             .map(non_negative),
-        conditions: snapshot.conditions,
+        updated_replicas: None,
+        conditions,
+    };
+
+    ConvertedWorkload {
+        snapshot,
+        observation,
     }
 }
 
-pub fn deployment_observation(deployment: &Deployment) -> WorkloadObservation {
-    let snapshot = deployment_snapshot(deployment);
+pub fn convert_deployment(deployment: &Deployment) -> ConvertedWorkload {
+    let observed_at = Utc::now();
+    let resource = deployment_ref(deployment);
     let status = deployment.status.as_ref();
 
-    WorkloadObservation {
-        resource: snapshot.resource,
-        observed_at: snapshot.observed_at,
-        desired_replicas: deployment
-            .spec
-            .as_ref()
-            .and_then(|spec| spec.replicas)
-            .map(non_negative)
-            .unwrap_or(1),
+    let conditions = status
+        .and_then(|status| status.conditions.as_deref())
+        .unwrap_or_default()
+        .iter()
+        .map(|condition| {
+            convert_condition(
+                &condition.type_,
+                &condition.status,
+                condition.reason.as_deref(),
+                condition.message.as_deref(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let snapshot = convert_snapshot(
+        &deployment.metadata,
+        resource.clone(),
+        observed_at,
+        status.and_then(|status| status.observed_generation),
+        conditions.clone(),
+    );
+
+    let observation = WorkloadObservation {
+        resource,
+        observed_at,
+        desired_replicas: desired_replicas(deployment.spec.as_ref().and_then(|spec| spec.replicas)),
         current_replicas: status
             .and_then(|status| status.replicas)
             .map(non_negative)
@@ -203,7 +157,54 @@ pub fn deployment_observation(deployment: &Deployment) -> WorkloadObservation {
         available_replicas: status
             .and_then(|status| status.available_replicas)
             .map(non_negative),
-        conditions: snapshot.conditions,
+        updated_replicas: status
+            .and_then(|status| status.updated_replicas)
+            .map(non_negative),
+        conditions,
+    };
+
+    ConvertedWorkload {
+        snapshot,
+        observation,
+    }
+}
+
+fn convert_condition(
+    condition_type: &str,
+    status: &str,
+    reason: Option<&str>,
+    message: Option<&str>,
+) -> ResourceCondition {
+    ResourceCondition {
+        condition_type: condition_type.to_owned(),
+        status: match status {
+            "True" => ConditionStatus::True,
+            "False" => ConditionStatus::False,
+            _ => ConditionStatus::Unknown,
+        },
+        reason: reason.map(str::to_owned),
+        message: message.map(str::to_owned),
+    }
+}
+
+fn convert_snapshot(
+    metadata: &ObjectMeta,
+    resource: ResourceRef,
+    observed_at: DateTime<Utc>,
+    observed_generation: Option<i64>,
+    conditions: Vec<ResourceCondition>,
+) -> ResourceSnapshot {
+    ResourceSnapshot {
+        resource,
+        observed_at,
+        metadata: ResourceMetadata {
+            labels: metadata.labels.clone().unwrap_or_default(),
+            annotations: metadata.annotations.clone().unwrap_or_default(),
+            generation: metadata.generation,
+            observed_generation,
+            deletion_timestamp: metadata.deletion_timestamp.as_ref().map(timestamp),
+        },
+        conditions,
     }
 }
 
@@ -230,7 +231,10 @@ pub async fn deployment_for_replica_set(
     let deployment = get_deployment(client, namespace, &owner.name).await?;
 
     if deployment.uid().as_deref() != Some(owner.uid.as_str()) {
-        return Ok(ParentDeployment::UidMismatch { expected: owner.uid.clone(), actual: deployment.uid() });
+        return Ok(ParentDeployment::UidMismatch {
+            expected: owner.uid.clone(),
+            actual: deployment.uid(),
+        });
     }
 
     Ok(ParentDeployment::Found(deployment))
@@ -347,11 +351,16 @@ pub async fn list_replica_sets_for_deployment(
                 .iter()
                 .any(|owner| {
                     owner.controller == Some(true)
+                        && owner.kind == "Deployment"
                         && owner.api_version == "apps/v1"
                         && owner.uid == deployment_uid
                 })
         })
         .collect())
+}
+
+fn desired_replicas(value: Option<i32>) -> u32 {
+    value.map(non_negative).unwrap_or(1)
 }
 
 fn non_negative(value: i32) -> u32 {
