@@ -2,11 +2,13 @@ use std::collections::{HashMap, HashSet};
 
 use aiops_core::{
     observations::{
-        CollectionError, ContainerHealth, HealthState, ObservationBundle, ObservationSource, ResourceEvent
+        CollectionError, HealthState, ObservationBundle, ObservationSource,
+        ResourceEvent,
     },
     resources::{RelationshipKind, ResourceRef, ResourceRelationship},
 };
 use chrono::{DateTime, Duration, Utc};
+use futures::{StreamExt, stream};
 use k8s_openapi::{
     api::{
         apps::v1::{Deployment, ReplicaSet},
@@ -53,6 +55,14 @@ struct CollectedTopology {
     errors: Vec<CollectionError>,
 }
 
+struct OwnedLogRequest {
+    resource: ResourceRef,
+    namespace: String,
+    pod: String,
+    container: String,
+    previous: bool,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum PodLogSelection {
     All,
@@ -85,7 +95,9 @@ impl KubernetesCollector {
         name: &str,
     ) -> Result<ObservationBundle, kube::Error> {
         let topology = self.resolve_replica_set(namespace, name).await?;
-        Ok(self.collect_topology(topology, PodLogSelection::UnhealthyOnly).await)
+        Ok(self
+            .collect_topology(topology, PodLogSelection::UnhealthyOnly)
+            .await)
     }
 
     pub async fn collect_deployment(
@@ -94,10 +106,16 @@ impl KubernetesCollector {
         name: &str,
     ) -> Result<ObservationBundle, kube::Error> {
         let topology = self.resolve_deployment(namespace, name).await?;
-        Ok(self.collect_topology(topology, PodLogSelection::UnhealthyOnly).await)
+        Ok(self
+            .collect_topology(topology, PodLogSelection::UnhealthyOnly)
+            .await)
     }
 
-    async fn collect_topology(&self, topology: CollectedTopology, log_selection: PodLogSelection) -> ObservationBundle {
+    async fn collect_topology(
+        &self,
+        topology: CollectedTopology,
+        log_selection: PodLogSelection,
+    ) -> ObservationBundle {
         let collection_started = Utc::now();
 
         let CollectedTopology {
@@ -118,7 +136,7 @@ impl KubernetesCollector {
             logs: Vec::new(),
             events: Vec::new(),
             health: Vec::new(),
-            errors
+            errors,
         };
 
         let deployment_ref = deployment.as_ref().map(|deployment| {
@@ -126,7 +144,9 @@ impl KubernetesCollector {
             let resource = snapshot.resource.clone();
 
             bundle.resources.push(snapshot);
-            bundle.workloads.push(workloads::deployment_observation(deployment));
+            bundle
+                .workloads
+                .push(workloads::deployment_observation(deployment));
 
             resource
         });
@@ -136,18 +156,17 @@ impl KubernetesCollector {
         for replica_set in &replica_sets {
             let snapshot = workloads::replica_set_snapshot(replica_set);
             let replica_set_ref = snapshot.resource.clone();
-            
+
             if let Some(uid) = replica_set.uid() {
                 replica_set_refs.insert(uid, replica_set_ref.clone());
             }
 
             if let Some(deployment_ref) = &deployment_ref {
-                let belongs_to_deployment = controller_owner(&replica_set.metadata)
-                    .is_some_and(|owner| {
+                let belongs_to_deployment =
+                    controller_owner(&replica_set.metadata).is_some_and(|owner| {
                         owner.kind == "Deployment"
                             && owner.api_version == "apps/v1"
-                            && deployment_ref.uid.as_deref()
-                                == Some(owner.uid.as_str())
+                            && deployment_ref.uid.as_deref() == Some(owner.uid.as_str())
                     });
 
                 if belongs_to_deployment {
@@ -160,7 +179,9 @@ impl KubernetesCollector {
             }
 
             bundle.resources.push(snapshot);
-            bundle.workloads.push(workloads::replica_set_observation(replica_set));
+            bundle
+                .workloads
+                .push(workloads::replica_set_observation(replica_set));
         }
 
         for pod in &collected_pods {
@@ -168,10 +189,9 @@ impl KubernetesCollector {
             let pod_ref = snapshot.resource.clone();
             let health = pods::health(pod);
 
-            if let Some(replica_set_ref) = controller_owner(&pod.metadata).filter(|owner| {
-                owner.kind == "ReplicaSet"
-                    && owner.api_version == "apps/v1"
-            }).and_then(|owner| replica_set_refs.get(&owner.uid))
+            if let Some(replica_set_ref) = controller_owner(&pod.metadata)
+                .filter(|owner| owner.kind == "ReplicaSet" && owner.api_version == "apps/v1")
+                .and_then(|owner| replica_set_refs.get(&owner.uid))
             {
                 bundle.relationships.push(ResourceRelationship {
                     kind: RelationshipKind::ControllerOwner,
@@ -185,7 +205,23 @@ impl KubernetesCollector {
         }
 
         self.collect_topology_events(&mut bundle).await;
-        self.collect_topology_logs(&collected_pods, log_selection, &mut bundle).await;
+        deduplicate_events(&mut bundle.events);
+        self.collect_topology_logs(&collected_pods, log_selection, &mut bundle)
+            .await;
+
+        bundle.events.sort_by(|left, right| {
+            left.last_seen
+                .cmp(&right.last_seen)
+                .then_with(|| left.regarding.name.cmp(&right.regarding.name))
+                .then_with(|| left.reason.cmp(&right.reason))
+        });
+
+        bundle.logs.sort_by(|left, right| {
+            left.timestamp
+                .cmp(&right.timestamp)
+                .then_with(|| left.resource.name.cmp(&right.resource.name))
+                .then_with(|| left.container.cmp(&right.container))
+        });
 
         bundle.collected_at = Utc::now();
         bundle
@@ -196,15 +232,19 @@ impl KubernetesCollector {
             return;
         }
 
-        let targets = bundle.resources.iter().map(|snapshot| snapshot.resource.clone()).collect::<HashSet<_>>();
+        let targets = bundle
+            .resources
+            .iter()
+            .map(|snapshot| snapshot.resource.clone())
+            .collect::<HashSet<_>>();
 
         for target in targets {
             match events::collect(self.client.inner(), &target).await {
                 Ok(events) => {
                     bundle.events.extend(
-                        events.into_iter().filter(|event| {
-                            event_within_window(event, bundle.collected_from)
-                        })
+                        events
+                            .into_iter()
+                            .filter(|event| event_within_window(event, bundle.collected_from)),
                     );
                 }
                 Err(error) => {
@@ -224,10 +264,82 @@ impl KubernetesCollector {
         }
     }
 
-    async fn collect_topology_logs(&self, collected_pods: &[Pod], log_selection: PodLogSelection, bundle: &mut ObservationBundle) {
+    async fn collect_topology_logs(
+        &self,
+        collected_pods: &[Pod],
+        log_selection: PodLogSelection,
+        bundle: &mut ObservationBundle,
+    ) {
         if !self.options.include_logs {
             return;
         }
+
+        let requests =
+            self.topology_log_requests(collected_pods, log_selection, &mut bundle.errors);
+
+        let client = self.client.inner();
+        let lookback = self.options.lookback.num_seconds();
+        let tail_lines = self.options.tail_lines;
+
+        let results = stream::iter(requests)
+            .map(|request| {
+                let client = client.clone();
+
+                async move {
+                    let result = logs::collect(
+                        client,
+                        request.resource.clone(),
+                        PodLogRequest {
+                            namespace: &request.namespace,
+                            pod: &request.pod,
+                            container: Some(&request.container),
+                            since_seconds: Some(lookback),
+                            tail_lines: Some(tail_lines),
+                            previous: request.previous,
+                        },
+                    )
+                    .await;
+
+                    (request, result)
+                }
+            })
+            .buffer_unordered(8)
+            .collect::<Vec<_>>()
+            .await;
+
+        for (request, result) in results {
+            match result {
+                Ok(logs) => bundle.logs.extend(logs),
+                Err(error) => {
+                    let generation = if request.previous {
+                        "previous"
+                    } else {
+                        "current"
+                    };
+
+                    bundle.errors.push(CollectionError {
+                        resource: Some(request.resource),
+                        source: ObservationSource::Logs,
+                        message: format!(
+                            "failed to collect {generation} logs for container {} in pod {}/{}: {error}",
+                            request.container,
+                            request.namespace,
+                            request.pod
+                        ),
+                        retryable: is_retryable(&error),
+                    });
+                }
+            }
+        }
+    }
+
+    fn topology_log_requests(
+        &self,
+        collected_pods: &[Pod],
+        log_selection: PodLogSelection,
+        errors: &mut Vec<CollectionError>,
+    ) -> Vec<OwnedLogRequest> {
+        let mut requests = Vec::new();
 
         for pod in collected_pods {
             let health = pods::health(pod);
@@ -243,93 +355,45 @@ impl KubernetesCollector {
                 continue;
             }
 
-            let pod_ref = health.resource.clone();
-            let containers = health.containers.clone();
+            let Some(namespace) = pod.metadata.namespace.clone() else {
+                errors.push(missing_log_metadata_error(&health.resource, "namespace"));
+                continue;
+            };
 
-            self.collect_container_logs(
-                pod,
-                &pod_ref,
-                &containers,
-                bundle,
-            )
-            .await;
-        }
-    }
+            let Some(pod_name) = pod.metadata.name.clone() else {
+                errors.push(missing_log_metadata_error(&health.resource, "name"));
+                continue;
+            };
 
-    async fn collect_container_logs(
-        &self,
-        pod: &Pod,
-        target: &ResourceRef,
-        containers: &[ContainerHealth],
-        bundle: &mut ObservationBundle,
-    ) {
-        let Some(namespace) = pod.metadata.namespace.as_deref() else {
-            bundle.errors.push(CollectionError {
-                resource: Some(target.clone()),
-                source: ObservationSource::Logs,
-                message: "pod has no namespace; logs cannot be collected".to_owned(),
-                retryable: false,
-            });
-            return;
-        };
+            for container in health.containers {
+                requests.push(OwnedLogRequest {
+                    resource: health.resource.clone(),
+                    namespace: namespace.clone(),
+                    pod: pod_name.clone(),
+                    container: container.name.clone(),
+                    previous: false,
+                });
 
-        let Some(pod_name) = pod.metadata.name.as_deref() else {
-            bundle.errors.push(CollectionError {
-                resource: Some(target.clone()),
-                source: ObservationSource::Logs,
-                message: "pod has no name; logs cannot be collected".to_owned(),
-                retryable: false,
-            });
-            return;
-        };
-
-        for container in containers {
-            self.collect_log_stream(namespace, pod_name, &container.name, false, target, bundle)
-                .await;
-
-            if self.options.include_previous_logs && container.restart_count > 0 {
-                self.collect_log_stream(namespace, pod_name, &container.name, true, target, bundle)
-                    .await;
+                if self.options.include_previous_logs && container.restart_count > 0 {
+                    requests.push(OwnedLogRequest {
+                        resource: health.resource.clone(),
+                        namespace: namespace.clone(),
+                        pod: pod_name.clone(),
+                        container: container.name,
+                        previous: true,
+                    });
+                }
             }
         }
+
+        requests
     }
 
-    async fn collect_log_stream(
+    async fn resolve_pod(
         &self,
         namespace: &str,
-        pod_name: &str,
-        container: &str,
-        previous: bool,
-        target: &ResourceRef,
-        bundle: &mut ObservationBundle,
-    ) {
-        let request = PodLogRequest {
-            namespace,
-            pod: pod_name,
-            container: Some(container),
-            since_seconds: Some(self.options.lookback.num_seconds()),
-            tail_lines: Some(self.options.tail_lines),
-            previous,
-        };
-
-        match logs::collect(self.client.inner(), target.clone(), request).await {
-            Ok(logs) => bundle.logs.extend(logs),
-            Err(error) => {
-                let generation = if previous { "previous" } else { "current" };
-
-                bundle.errors.push(CollectionError {
-                    resource: Some(target.clone()),
-                    source: ObservationSource::Logs,
-                    message: format!(
-                        "failed to collect {generation} logs for container {container}: {error}"
-                    ),
-                    retryable: is_retryable(&error),
-                });
-            }
-        }
-    }
-
-    async fn resolve_pod(&self, namespace: &str, name: &str) -> Result<CollectedTopology, kube::Error> {
+        name: &str,
+    ) -> Result<CollectedTopology, kube::Error> {
         let pod = pods::get(self.client.inner(), namespace, name).await?;
         let target = pods::snapshot(&pod).resource;
 
@@ -343,11 +407,19 @@ impl KubernetesCollector {
 
         let pod = &topology.pods[0];
 
-        let Some(replica_set_owner) = controller_owner(&pod.metadata).filter(|owner| owner.kind == "ReplicaSet" && owner.api_version == "apps/v1") else {
+        let Some(replica_set_owner) = controller_owner(&pod.metadata)
+            .filter(|owner| owner.kind == "ReplicaSet" && owner.api_version == "apps/v1")
+        else {
             return Ok(topology);
         };
 
-        let replica_set = match workloads::get_replica_set(self.client.inner(), namespace, &replica_set_owner.name).await {
+        let replica_set = match workloads::get_replica_set(
+            self.client.inner(),
+            namespace,
+            &replica_set_owner.name,
+        )
+        .await
+        {
             Ok(replica_set) => replica_set,
             Err(error) => {
                 topology.errors.push(CollectionError {
@@ -382,7 +454,9 @@ impl KubernetesCollector {
             return Ok(topology);
         }
 
-        let parent_deployment = workloads::deployment_for_replica_set(self.client.inner(), namespace, &replica_set).await;
+        let parent_deployment =
+            workloads::deployment_for_replica_set(self.client.inner(), namespace, &replica_set)
+                .await;
 
         match parent_deployment {
             Ok(ParentDeployment::Found(deployment)) => {
@@ -434,11 +508,29 @@ impl KubernetesCollector {
             .resource
             .clone();
 
-        let pods =
-            workloads::list_pods_for_replica_set(self.client.inner(), namespace, &replica_set)
-                .await?;
-
         let mut errors = Vec::new();
+
+        let pods = match workloads::list_pods_for_replica_set(
+            self.client.inner(),
+            namespace,
+            &replica_set,
+        )
+        .await
+        {
+            Ok(pods) => pods,
+            Err(error) => {
+                errors.push(CollectionError {
+                    resource: Some(target.clone()),
+                    source: ObservationSource::ResourceState,
+                    message: format!(
+                        "failed to list pods owned by ReplicaSet {namespace}/{name}: {error}"
+                    ),
+                    retryable: is_retryable(&error),
+                });
+
+                Vec::new()
+            }
+        };
 
         let deployment: Option<Deployment> = match workloads::deployment_for_replica_set(
             self.client.inner(),
@@ -494,32 +586,68 @@ impl KubernetesCollector {
 
         let target = workloads::deployment_snapshot(&deployment).resource.clone();
 
-        let replica_sets = workloads::list_replica_sets_for_deployment(
+        let mut errors = Vec::new();
+
+        let replica_sets = match workloads::list_replica_sets_for_deployment(
             self.client.inner(),
             namespace,
             &deployment,
         )
-        .await?;
+        .await
+        {
+            Ok(replica_sets) => replica_sets,
+            Err(error) => {
+                errors.push(CollectionError {
+                    resource: Some(target.clone()),
+                    source: ObservationSource::ResourceState,
+                    message: format!(
+                        "failed to list ReplicaSets owned by Deployment {namespace}/{name}: {error}"
+                    ),
+                    retryable: is_retryable(&error),
+                });
+
+                Vec::new()
+            }
+        };
 
         let owner_uids = replica_sets
             .iter()
             .filter_map(ResourceExt::uid)
             .collect::<HashSet<_>>();
 
-        let pods = workloads::list_pods_for_replica_sets(
-            self.client.inner(),
-            namespace,
-            &deployment,
-            &owner_uids,
-        )
-        .await?;
+        let pods = if owner_uids.is_empty() {
+            Vec::new()
+        } else {
+            match workloads::list_pods_for_replica_sets(
+                self.client.inner(),
+                namespace,
+                &deployment,
+                &owner_uids,
+            )
+            .await
+            {
+                Ok(pods) => pods,
+                Err(error) => {
+                    errors.push(CollectionError {
+                        resource: Some(target.clone()),
+                        source: ObservationSource::ResourceState,
+                        message: format!(
+                            "failed to list pods owned by Deployment {namespace}/{name}: {error}"
+                        ),
+                        retryable: is_retryable(&error),
+                    });
+
+                    Vec::new()
+                }
+            }
+        };
 
         Ok(CollectedTopology {
             target,
             deployment: Some(deployment),
             replica_sets,
             pods,
-            errors: Vec::new(),
+            errors,
         })
     }
 }
@@ -550,6 +678,40 @@ fn is_retryable(error: &kube::Error) -> bool {
         }
         _ => true,
     }
+}
+
+fn missing_log_metadata_error(resource: &ResourceRef, field: &str) -> CollectionError {
+    let namespace = resource.namespace.as_deref().unwrap_or("<unknown>");
+
+    let name = if resource.name.is_empty() {
+        "<unknown>"
+    } else {
+        &resource.name
+    };
+
+    CollectionError {
+        resource: Some(resource.clone()),
+        source: ObservationSource::Logs,
+        message: format!(
+            "pod {namespace}/{name} has no metadata.{field}; logs cannot be collected"
+        ),
+        retryable: false
+    }
+}
+
+fn deduplicate_events(events: &mut Vec<ResourceEvent>) {
+    let mut seen = HashSet::new();
+
+    events.retain(|event| {
+        seen.insert((
+            event.regarding.clone(),
+            event.reporting_controller.clone(),
+            event.reason.clone(),
+            event.message.clone(),
+            event.first_seen,
+            event.last_seen,
+        ))
+    });
 }
 
 #[cfg(test)]
