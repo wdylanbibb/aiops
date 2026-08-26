@@ -40,11 +40,26 @@ pub struct ObservationBundle {
 pub struct CollectionError {
     pub resource: Option<ResourceRef>,
     pub source: ObservationSource,
+    #[serde(default)]
+    pub kind: CollectionErrorKind,
     pub message: String,
     pub retryable: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollectionErrorKind {
+    OwnerLookup,
+    ChildList,
+    UidMismatch,
+    EventList,
+    LogRead,
+    InvalidMetadata,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ObservationSource {
     ResourceState,

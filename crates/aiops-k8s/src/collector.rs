@@ -2,7 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use aiops_core::{
     observations::{
-        CollectionError, HealthState, ObservationBundle, ObservationSource, ResourceEvent,
+        CollectionError, CollectionErrorKind, HealthState, ObservationBundle, ObservationSource,
+        ResourceEvent,
     },
     resources::{RelationshipKind, ResourceRef, ResourceRelationship},
 };
@@ -84,8 +85,11 @@ impl KubernetesCollector {
         namespace: &str,
         name: &str,
     ) -> Result<ObservationBundle, kube::Error> {
+        let collection_started = Utc::now();
         let topology = self.resolve_pod(namespace, name).await?;
-        Ok(self.collect_topology(topology, PodLogSelection::All).await)
+        Ok(self
+            .collect_topology(topology, PodLogSelection::All, collection_started)
+            .await)
     }
 
     pub async fn collect_replica_set(
@@ -93,9 +97,10 @@ impl KubernetesCollector {
         namespace: &str,
         name: &str,
     ) -> Result<ObservationBundle, kube::Error> {
+        let collection_started = Utc::now();
         let topology = self.resolve_replica_set(namespace, name).await?;
         Ok(self
-            .collect_topology(topology, PodLogSelection::UnhealthyOnly)
+            .collect_topology(topology, PodLogSelection::UnhealthyOnly, collection_started)
             .await)
     }
 
@@ -104,9 +109,10 @@ impl KubernetesCollector {
         namespace: &str,
         name: &str,
     ) -> Result<ObservationBundle, kube::Error> {
+        let collection_started = Utc::now();
         let topology = self.resolve_deployment(namespace, name).await?;
         Ok(self
-            .collect_topology(topology, PodLogSelection::UnhealthyOnly)
+            .collect_topology(topology, PodLogSelection::UnhealthyOnly, collection_started)
             .await)
     }
 
@@ -114,9 +120,8 @@ impl KubernetesCollector {
         &self,
         topology: CollectedTopology,
         log_selection: PodLogSelection,
+        collection_started: DateTime<Utc>,
     ) -> ObservationBundle {
-        let collection_started = Utc::now();
-
         let CollectedTopology {
             target,
             deployment,
@@ -215,8 +220,31 @@ impl KubernetesCollector {
         bundle.logs.sort_by(|left, right| {
             left.timestamp
                 .cmp(&right.timestamp)
-                .then_with(|| left.resource.name.cmp(&right.resource.name))
+                .then_with(|| left.resource.cmp(&right.resource))
                 .then_with(|| left.container.cmp(&right.container))
+        });
+
+        bundle
+            .resources
+            .sort_by(|left, right| left.resource.cmp(&right.resource));
+        bundle
+            .workloads
+            .sort_by(|left, right| left.resource.cmp(&right.resource));
+        bundle
+            .health
+            .sort_by(|left, right| left.resource.cmp(&right.resource));
+        bundle.relationships.sort_by(|left, right| {
+            left.owner
+                .cmp(&right.owner)
+                .then_with(|| left.dependent.cmp(&right.dependent))
+                .then_with(|| left.kind.cmp(&right.kind))
+        });
+        bundle.errors.sort_by(|left, right| {
+            left.resource
+                .cmp(&right.resource)
+                .then_with(|| left.source.cmp(&right.source))
+                .then_with(|| left.kind.cmp(&right.kind))
+                .then_with(|| left.message.cmp(&right.message))
         });
 
         bundle.collected_at = Utc::now();
@@ -232,21 +260,38 @@ impl KubernetesCollector {
             .resources
             .iter()
             .map(|snapshot| snapshot.resource.clone())
-            .collect::<HashSet<_>>();
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
 
-        for target in targets {
-            match events::collect(self.client.inner(), &target).await {
+        let client = self.client.inner();
+        let cutoff = bundle.collected_from;
+        let results = stream::iter(targets)
+            .map(|target| {
+                let client = client.clone();
+                async move {
+                    let result = events::collect(client, &target).await;
+                    (target, result)
+                }
+            })
+            .buffer_unordered(8)
+            .collect::<Vec<_>>()
+            .await;
+
+        for (target, result) in results {
+            match result {
                 Ok(events) => {
                     bundle.events.extend(
                         events
                             .into_iter()
-                            .filter(|event| event_within_window(event, bundle.collected_from)),
+                            .filter(|event| event_within_window(event, cutoff)),
                     );
                 }
                 Err(error) => {
                     bundle.errors.push(CollectionError {
                         resource: Some(target.clone()),
                         source: ObservationSource::Events,
+                        kind: CollectionErrorKind::EventList,
                         message: format!(
                             "failed to collect events for {:?} {}/{}: {error}",
                             target.kind,
@@ -316,6 +361,7 @@ impl KubernetesCollector {
                     bundle.errors.push(CollectionError {
                         resource: Some(request.resource),
                         source: ObservationSource::Logs,
+                        kind: CollectionErrorKind::LogRead,
                         message: format!(
                             "failed to collect {generation} logs for container {} in pod {}/{}: {error}",
                             request.container,
@@ -421,6 +467,7 @@ impl KubernetesCollector {
                 topology.errors.push(CollectionError {
                     resource: Some(target),
                     source: ObservationSource::ResourceState,
+                    kind: CollectionErrorKind::OwnerLookup,
                     message: format!(
                         "failed to collect parent ReplicaSet {namespace}/{} for Pod {namespace}/{name}: {error}",
                         replica_set_owner.name,
@@ -438,6 +485,7 @@ impl KubernetesCollector {
             topology.errors.push(CollectionError {
                 resource: Some(target),
                 source: ObservationSource::ResourceState,
+                kind: CollectionErrorKind::UidMismatch,
                 message: format!(
                     "parent ReplicaSet {namespace}/{} has UID {}, but Pod {namespace}/{name} references UID {}; the ReplicaSet may have been deleted and recreated",
                     replica_set_owner.name,
@@ -456,7 +504,7 @@ impl KubernetesCollector {
 
         match parent_deployment {
             Ok(ParentDeployment::Found(deployment)) => {
-                topology.deployment = Some(deployment);
+                topology.deployment = Some(*deployment);
             }
             Ok(ParentDeployment::UidMismatch { expected, actual }) => {
                 let replica_set_ref = workloads::replica_set_ref(&replica_set);
@@ -464,6 +512,7 @@ impl KubernetesCollector {
                 topology.errors.push(CollectionError {
                     resource: Some(replica_set_ref),
                     source: ObservationSource::ResourceState,
+                    kind: CollectionErrorKind::UidMismatch,
                     message: format!(
                         "parent Deployment for ReplicaSet {namespace}/{} has UID {}, but its owner reference expects UID {expected}; the Deployment may have been deleted and recreated",
                         replica_set_owner.name,
@@ -479,6 +528,7 @@ impl KubernetesCollector {
                 topology.errors.push(CollectionError {
                     resource: Some(replica_set_ref),
                     source: ObservationSource::ResourceState,
+                    kind: CollectionErrorKind::OwnerLookup,
                     message: format!(
                         "failed to collect parent Deployment for ReplicaSet {namespace}/{}: {error}",
                         replica_set_owner.name,
@@ -504,25 +554,27 @@ impl KubernetesCollector {
 
         let mut errors = Vec::new();
 
-        let pods = match workloads::list_pods_for_replica_set(
-            self.client.inner(),
-            namespace,
-            &replica_set,
-        )
-        .await
-        {
-            Ok(pods) => pods,
-            Err(error) => {
-                errors.push(CollectionError {
-                    resource: Some(target.clone()),
-                    source: ObservationSource::ResourceState,
-                    message: format!(
-                        "failed to list pods owned by ReplicaSet {namespace}/{name}: {error}"
-                    ),
-                    retryable: is_retryable(&error),
-                });
+        let pods = if target.uid.is_none() {
+            errors.push(missing_resource_uid_error(&target));
+            Vec::new()
+        } else {
+            match workloads::list_pods_for_replica_set(self.client.inner(), namespace, &replica_set)
+                .await
+            {
+                Ok(pods) => pods,
+                Err(error) => {
+                    errors.push(CollectionError {
+                        resource: Some(target.clone()),
+                        source: ObservationSource::ResourceState,
+                        kind: CollectionErrorKind::ChildList,
+                        message: format!(
+                            "failed to list pods owned by ReplicaSet {namespace}/{name}: {error}"
+                        ),
+                        retryable: is_retryable(&error),
+                    });
 
-                Vec::new()
+                    Vec::new()
+                }
             }
         };
 
@@ -534,11 +586,12 @@ impl KubernetesCollector {
         .await
         {
             Ok(deployment) => match deployment {
-                ParentDeployment::Found(deployment) => Some(deployment),
+                ParentDeployment::Found(deployment) => Some(*deployment),
                 ParentDeployment::UidMismatch { expected, actual } => {
                     errors.push(CollectionError {
                         resource: Some(target.clone()),
                         source: ObservationSource::ResourceState,
+                        kind: CollectionErrorKind::UidMismatch,
                         message: format!(
                             "parent Deployment for ReplicaSet {namespace}/{name} has UID {}, but the ReplicaSet owner reference expects UID {expected}; the Deployment may have been deleted and recreated",
                             actual.as_deref().unwrap_or("<missing>")
@@ -554,6 +607,7 @@ impl KubernetesCollector {
                 errors.push(CollectionError {
                     resource: Some(target.clone()),
                     source: ObservationSource::ResourceState,
+                    kind: CollectionErrorKind::OwnerLookup,
                     message: format!("failed to collect parent Deployment for ReplicaSet {namespace}/{name}: {error}"),
                     retryable: is_retryable(&error),
                 });
@@ -582,27 +636,42 @@ impl KubernetesCollector {
 
         let mut errors = Vec::new();
 
-        let replica_sets = match workloads::list_replica_sets_for_deployment(
-            self.client.inner(),
-            namespace,
-            &deployment,
-        )
-        .await
-        {
-            Ok(replica_sets) => replica_sets,
-            Err(error) => {
-                errors.push(CollectionError {
-                    resource: Some(target.clone()),
-                    source: ObservationSource::ResourceState,
-                    message: format!(
-                        "failed to list ReplicaSets owned by Deployment {namespace}/{name}: {error}"
-                    ),
-                    retryable: is_retryable(&error),
-                });
+        let replica_sets = if target.uid.is_none() {
+            errors.push(missing_resource_uid_error(&target));
+            Vec::new()
+        } else {
+            match workloads::list_replica_sets_for_deployment(
+                self.client.inner(),
+                namespace,
+                &deployment,
+            )
+            .await
+            {
+                Ok(replica_sets) => replica_sets,
+                Err(error) => {
+                    errors.push(CollectionError {
+                        resource: Some(target.clone()),
+                        source: ObservationSource::ResourceState,
+                        kind: CollectionErrorKind::ChildList,
+                        message: format!(
+                            "failed to list ReplicaSets owned by Deployment {namespace}/{name}: {error}"
+                        ),
+                        retryable: is_retryable(&error),
+                    });
 
-                Vec::new()
+                    Vec::new()
+                }
             }
         };
+
+        for replica_set in replica_sets
+            .iter()
+            .filter(|replica_set| replica_set.uid().is_none())
+        {
+            errors.push(missing_resource_uid_error(&workloads::replica_set_ref(
+                replica_set,
+            )));
+        }
 
         let owner_uids = replica_sets
             .iter()
@@ -625,6 +694,7 @@ impl KubernetesCollector {
                     errors.push(CollectionError {
                         resource: Some(target.clone()),
                         source: ObservationSource::ResourceState,
+                        kind: CollectionErrorKind::ChildList,
                         message: format!(
                             "failed to list pods owned by Deployment {namespace}/{name}: {error}"
                         ),
@@ -686,8 +756,24 @@ fn missing_log_metadata_error(resource: &ResourceRef, field: &str) -> Collection
     CollectionError {
         resource: Some(resource.clone()),
         source: ObservationSource::Logs,
+        kind: CollectionErrorKind::InvalidMetadata,
         message: format!(
             "pod {namespace}/{name} has no metadata.{field}; logs cannot be collected"
+        ),
+        retryable: false,
+    }
+}
+
+fn missing_resource_uid_error(resource: &ResourceRef) -> CollectionError {
+    CollectionError {
+        resource: Some(resource.clone()),
+        source: ObservationSource::ResourceState,
+        kind: CollectionErrorKind::InvalidMetadata,
+        message: format!(
+            "{:?} {}/{} has no metadata.uid; ownership cannot be resolved",
+            resource.kind,
+            resource.namespace.as_deref().unwrap_or("<cluster>"),
+            resource.name,
         ),
         retryable: false,
     }

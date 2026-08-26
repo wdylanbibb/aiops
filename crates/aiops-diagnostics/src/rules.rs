@@ -467,12 +467,16 @@ fn replica_evidence(workload: &WorkloadObservation) -> Evidence {
     Evidence {
         source: ObservationSource::ResourceState,
         summary: format!(
-            "desired={}, current={}, ready={}, available={}",
+            "desired={}, current={}, ready={}, available={}, updated={}",
             workload.desired_replicas,
             workload.current_replicas,
             workload.ready_replicas,
             workload
                 .available_replicas
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".into()),
+            workload
+                .updated_replicas
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "unknown".into()),
         ),
@@ -546,7 +550,7 @@ impl DiagnosticRule for WorkloadGenerationRule {
                 let generation = snapshot.metadata.generation?;
                 let observed = snapshot.metadata.observed_generation?;
 
-                if observed > generation {
+                if observed >= generation {
                     return None;
                 }
 
@@ -585,11 +589,13 @@ pub struct WorkloadNoOwnedPodsRule;
 impl DiagnosticRule for WorkloadNoOwnedPodsRule {
     fn evaluate(&self, bundle: &aiops_core::observations::ObservationBundle) -> Vec<Finding> {
         // Avoid claiming there are no pods when topology collection failed
-        if bundle
-            .errors
-            .iter()
-            .any(|error| error.source == ObservationSource::ResourceState)
-        {
+        if bundle.errors.iter().any(|error| {
+            matches!(
+                error.kind,
+                aiops_core::observations::CollectionErrorKind::ChildList
+                    | aiops_core::observations::CollectionErrorKind::InvalidMetadata
+            )
+        }) {
             return Vec::new();
         }
 

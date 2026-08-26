@@ -82,7 +82,7 @@ fn merge_finding(existing: &mut Finding, incoming: Finding) {
         existing.severity = incoming.severity;
     }
     if confidence_rank(&incoming.confidence) > confidence_rank(&existing.confidence) {
-        existing.confidence = incoming.confidence.clone();
+        existing.confidence = incoming.confidence;
     }
 
     if incoming_is_stronger {
@@ -151,7 +151,7 @@ mod tests {
         observations::{CollectionError, ObservationSource},
         resources::ResourceKind,
     };
-    use chrono::TimeZone;
+    use chrono::{TimeZone, Utc};
 
     fn resource(name: &str) -> ResourceRef {
         ResourceRef {
@@ -246,6 +246,7 @@ mod tests {
             errors: vec![CollectionError {
                 resource: None,
                 source: ObservationSource::Events,
+                kind: aiops_core::observations::CollectionErrorKind::Unknown,
                 message: "unavailable".into(),
                 retryable: true,
             }],

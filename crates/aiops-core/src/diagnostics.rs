@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    observations::{self, ObservationBundle, ObservationSource},
+    observations::{ObservationBundle, ObservationSource},
     resources::ResourceRef,
 };
 
@@ -87,7 +87,7 @@ pub enum Severity {
     Critical,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Confidence {
     Low,
@@ -100,19 +100,4 @@ pub struct Evidence {
     pub source: ObservationSource,
     pub summary: String,
     pub timestamp: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum FindingCategory {
-    CrashLoop,
-    ImagePull,
-    Scheduling,
-    Readiness,
-    ResourceExhaustion,
-    Storage,
-    Networking,
-    Configuration,
-    Rollout,
-    Dependency,
-    Unknown,
 }

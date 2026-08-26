@@ -9,7 +9,7 @@ use aiops_core::{
 };
 use chrono::{DateTime, Utc};
 use k8s_openapi::api::{
-    apps::v1::{DaemonSet, Deployment, ReplicaSet, StatefulSet},
+    apps::v1::{Deployment, ReplicaSet},
     core::v1::Pod,
 };
 use kube::{
@@ -22,7 +22,7 @@ use crate::convert::resource_ref;
 
 pub enum ParentDeployment {
     None,
-    Found(Deployment),
+    Found(Box<Deployment>),
     UidMismatch {
         expected: String,
         actual: Option<String>,
@@ -237,7 +237,7 @@ pub async fn deployment_for_replica_set(
         });
     }
 
-    Ok(ParentDeployment::Found(deployment))
+    Ok(ParentDeployment::Found(Box::new(deployment)))
 }
 
 pub async fn list_pods_for_replica_set(
