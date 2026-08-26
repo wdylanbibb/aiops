@@ -1,18 +1,27 @@
+use std::collections::{HashMap, HashSet};
+
 use aiops_core::{
     observations::{
-        CollectionError, ContainerHealth, ObservationBundle, ObservationSource, ResourceEvent,
+        CollectionError, ContainerHealth, HealthState, ObservationBundle, ObservationSource, ResourceEvent
     },
     resources::{RelationshipKind, ResourceRef, ResourceRelationship},
 };
 use chrono::{DateTime, Duration, Utc};
-use k8s_openapi::{api::core::v1::Pod, apimachinery::pkg::apis::meta::v1::OwnerReference};
+use k8s_openapi::{
+    api::{
+        apps::v1::{Deployment, ReplicaSet},
+        core::v1::Pod,
+    },
+    apimachinery::pkg::apis::meta::v1::OwnerReference,
+};
 use kube::{ResourceExt, api::ObjectMeta};
 
 use crate::{
     client::KubernetesClient,
     events,
     logs::{self, PodLogRequest},
-    pods, workloads,
+    pods,
+    workloads::{self, ParentDeployment},
 };
 
 #[derive(Debug, Clone)]
@@ -36,6 +45,20 @@ impl Default for CollectionOptions {
     }
 }
 
+struct CollectedTopology {
+    target: ResourceRef,
+    deployment: Option<Deployment>,
+    replica_sets: Vec<ReplicaSet>,
+    pods: Vec<Pod>,
+    errors: Vec<CollectionError>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PodLogSelection {
+    All,
+    UnhealthyOnly,
+}
+
 #[derive(Clone)]
 pub struct KubernetesCollector {
     client: KubernetesClient,
@@ -52,143 +75,185 @@ impl KubernetesCollector {
         namespace: &str,
         name: &str,
     ) -> Result<ObservationBundle, kube::Error> {
-        let collected_at = Utc::now();
-        let pod = pods::get(self.client.inner(), namespace, name).await?;
+        let topology = self.resolve_pod(namespace, name).await?;
+        Ok(self.collect_topology(topology, PodLogSelection::All).await)
+    }
 
-        let snapshot = pods::snapshot(&pod);
-        let target = snapshot.resource.clone();
+    pub async fn collect_replica_set(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<ObservationBundle, kube::Error> {
+        let topology = self.resolve_replica_set(namespace, name).await?;
+        Ok(self.collect_topology(topology, PodLogSelection::UnhealthyOnly).await)
+    }
 
-        let health = pods::health(&pod);
-        let containers = health.containers.clone();
+    pub async fn collect_deployment(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<ObservationBundle, kube::Error> {
+        let topology = self.resolve_deployment(namespace, name).await?;
+        Ok(self.collect_topology(topology, PodLogSelection::UnhealthyOnly).await)
+    }
+
+    async fn collect_topology(&self, topology: CollectedTopology, log_selection: PodLogSelection) -> ObservationBundle {
+        let collection_started = Utc::now();
+
+        let CollectedTopology {
+            target,
+            deployment,
+            replica_sets,
+            pods: collected_pods,
+            errors,
+        } = topology;
 
         let mut bundle = ObservationBundle {
-            target: target.clone(),
-            collected_from: collected_at - self.options.lookback,
-            collected_at,
-            resources: vec![snapshot],
+            target,
+            collected_from: collection_started - self.options.lookback,
+            collected_at: collection_started,
+            resources: Vec::new(),
             relationships: Vec::new(),
             workloads: Vec::new(),
             logs: Vec::new(),
             events: Vec::new(),
-            health: vec![health],
-            errors: Vec::new(),
+            health: Vec::new(),
+            errors
         };
 
-        self.collect_pod_owner_chain(namespace, &pod, &mut bundle)
-            .await;
+        let deployment_ref = deployment.as_ref().map(|deployment| {
+            let snapshot = workloads::deployment_snapshot(deployment);
+            let resource = snapshot.resource.clone();
 
-        if self.options.include_events {
-            match events::collect(self.client.inner(), &target).await {
-                Ok(events) => {
-                    bundle.events = events
-                        .into_iter()
-                        .filter(|event| event_within_window(event, bundle.collected_from))
-                        .collect();
-                }
-                Err(error) => bundle.errors.push(CollectionError {
-                    resource: Some(target.clone()),
-                    source: ObservationSource::Events,
-                    message: error.to_string(),
-                    retryable: is_retryable(&error),
-                }),
-            }
-        }
+            bundle.resources.push(snapshot);
+            bundle.workloads.push(workloads::deployment_observation(deployment));
 
-        if self.options.include_logs {
-            self.collect_container_logs(&pod, &target, &containers, &mut bundle)
-                .await;
-        }
-
-        Ok(bundle)
-    }
-
-    async fn collect_pod_owner_chain(
-        &self,
-        namespace: &str,
-        pod: &Pod,
-        bundle: &mut ObservationBundle,
-    ) {
-        let pod_ref = pods::snapshot(pod).resource;
-
-        let Some(replica_set_owner) =
-            controller_owner(&pod.metadata).filter(|owner| owner.kind == "ReplicaSet")
-        else {
-            return;
-        };
-
-        let replica_set = match workloads::get_replica_set(
-            self.client.inner(),
-            namespace,
-            &replica_set_owner.name,
-        )
-        .await
-        {
-            Ok(replica_set) => replica_set,
-            Err(error) => {
-                push_owner_error(bundle, &pod_ref, replica_set_owner, error);
-                return;
-            }
-        };
-
-        // Owner deleted and recreated with the same name
-        if replica_set.uid().as_deref() != Some(replica_set_owner.uid.as_str()) {
-            push_uid_mismatch(bundle, &pod_ref, replica_set_owner);
-            return;
-        }
-
-        let replica_set_ref = workloads::replica_set_snapshot(&replica_set)
-            .resource
-            .clone();
-
-        bundle.relationships.push(ResourceRelationship {
-            kind: RelationshipKind::ControllerOwner,
-            owner: replica_set_ref.clone(),
-            dependent: pod_ref,
+            resource
         });
 
-        bundle
-            .resources
-            .push(workloads::replica_set_snapshot(&replica_set));
+        let mut replica_set_refs = HashMap::<String, ResourceRef>::new();
 
-        bundle
-            .workloads
-            .push(workloads::replica_set_observation(&replica_set));
+        for replica_set in &replica_sets {
+            let snapshot = workloads::replica_set_snapshot(replica_set);
+            let replica_set_ref = snapshot.resource.clone();
+            
+            if let Some(uid) = replica_set.uid() {
+                replica_set_refs.insert(uid, replica_set_ref.clone());
+            }
 
-        let Some(deployment_owner) =
-            controller_owner(&replica_set.metadata).filter(|owner| owner.kind == "Deployment")
-        else {
-            return;
-        };
+            if let Some(deployment_ref) = &deployment_ref {
+                let belongs_to_deployment = controller_owner(&replica_set.metadata)
+                    .is_some_and(|owner| {
+                        owner.kind == "Deployment"
+                            && owner.api_version == "apps/v1"
+                            && deployment_ref.uid.as_deref()
+                                == Some(owner.uid.as_str())
+                    });
 
-        let deployment =
-            match workloads::get_deployment(self.client.inner(), namespace, &deployment_owner.name)
-                .await
+                if belongs_to_deployment {
+                    bundle.relationships.push(ResourceRelationship {
+                        kind: RelationshipKind::ControllerOwner,
+                        owner: deployment_ref.clone(),
+                        dependent: replica_set_ref.clone(),
+                    });
+                }
+            }
+
+            bundle.resources.push(snapshot);
+            bundle.workloads.push(workloads::replica_set_observation(replica_set));
+        }
+
+        for pod in &collected_pods {
+            let snapshot = pods::snapshot(pod);
+            let pod_ref = snapshot.resource.clone();
+            let health = pods::health(pod);
+
+            if let Some(replica_set_ref) = controller_owner(&pod.metadata).filter(|owner| {
+                owner.kind == "ReplicaSet"
+                    && owner.api_version == "apps/v1"
+            }).and_then(|owner| replica_set_refs.get(&owner.uid))
             {
-                Ok(deployment) => deployment,
+                bundle.relationships.push(ResourceRelationship {
+                    kind: RelationshipKind::ControllerOwner,
+                    owner: replica_set_ref.clone(),
+                    dependent: pod_ref,
+                });
+            }
+
+            bundle.resources.push(snapshot);
+            bundle.health.push(health);
+        }
+
+        self.collect_topology_events(&mut bundle).await;
+        self.collect_topology_logs(&collected_pods, log_selection, &mut bundle).await;
+
+        bundle.collected_at = Utc::now();
+        bundle
+    }
+
+    async fn collect_topology_events(&self, bundle: &mut ObservationBundle) {
+        if !self.options.include_events {
+            return;
+        }
+
+        let targets = bundle.resources.iter().map(|snapshot| snapshot.resource.clone()).collect::<HashSet<_>>();
+
+        for target in targets {
+            match events::collect(self.client.inner(), &target).await {
+                Ok(events) => {
+                    bundle.events.extend(
+                        events.into_iter().filter(|event| {
+                            event_within_window(event, bundle.collected_from)
+                        })
+                    );
+                }
                 Err(error) => {
-                    push_owner_error(bundle, &replica_set_ref, deployment_owner, error);
-                    return;
+                    bundle.errors.push(CollectionError {
+                        resource: Some(target.clone()),
+                        source: ObservationSource::Events,
+                        message: format!(
+                            "failed to collect events for {:?} {}/{}: {error}",
+                            target.kind,
+                            target.namespace.as_deref().unwrap_or("<cluster>"),
+                            target.name,
+                        ),
+                        retryable: is_retryable(&error),
+                    });
+                }
+            }
+        }
+    }
+
+    async fn collect_topology_logs(&self, collected_pods: &[Pod], log_selection: PodLogSelection, bundle: &mut ObservationBundle) {
+        if !self.options.include_logs {
+            return;
+        }
+
+        for pod in collected_pods {
+            let health = pods::health(pod);
+
+            let should_collect = match log_selection {
+                PodLogSelection::All => true,
+                PodLogSelection::UnhealthyOnly => {
+                    health.state != HealthState::Healthy || health.restart_count.unwrap_or(0) > 0
                 }
             };
 
-        if deployment.uid().as_deref() != Some(deployment_owner.uid.as_str()) {
-            push_uid_mismatch(bundle, &replica_set_ref, deployment_owner);
-            return;
+            if !should_collect {
+                continue;
+            }
+
+            let pod_ref = health.resource.clone();
+            let containers = health.containers.clone();
+
+            self.collect_container_logs(
+                pod,
+                &pod_ref,
+                &containers,
+                bundle,
+            )
+            .await;
         }
-
-        let deployment_snapshot = workloads::deployment_snapshot(&deployment);
-        let deployment_ref = deployment_snapshot.resource.clone();
-
-        bundle.relationships.push(ResourceRelationship {
-            kind: RelationshipKind::ControllerOwner,
-            owner: deployment_ref,
-            dependent: replica_set_ref,
-        });
-
-        bundle.resources.push(deployment_snapshot);
-        bundle
-            .workloads
-            .push(workloads::deployment_observation(&deployment));
     }
 
     async fn collect_container_logs(
@@ -263,39 +328,200 @@ impl KubernetesCollector {
             }
         }
     }
-}
 
-fn push_owner_error(
-    bundle: &mut ObservationBundle,
-    dependent: &ResourceRef,
-    owner: &OwnerReference,
-    error: kube::Error,
-) {
-    bundle.errors.push(CollectionError {
-        resource: Some(dependent.clone()),
-        source: ObservationSource::ResourceState,
-        message: format!(
-            "failed to collect owner {} {}: {error}",
-            owner.kind, owner.name
-        ),
-        retryable: is_retryable(&error),
-    });
-}
+    async fn resolve_pod(&self, namespace: &str, name: &str) -> Result<CollectedTopology, kube::Error> {
+        let pod = pods::get(self.client.inner(), namespace, name).await?;
+        let target = pods::snapshot(&pod).resource;
 
-fn push_uid_mismatch(
-    bundle: &mut ObservationBundle,
-    dependent: &ResourceRef,
-    owner: &OwnerReference,
-) {
-    bundle.errors.push(CollectionError {
-        resource: Some(dependent.clone()),
-        source: ObservationSource::ResourceState,
-        message: format!(
-            "{} {} was recreated and no longer matches owner UID {}",
-            owner.kind, owner.name, owner.uid
-        ),
-        retryable: false,
-    });
+        let mut topology = CollectedTopology {
+            target: target.clone(),
+            deployment: None,
+            replica_sets: Vec::new(),
+            pods: vec![pod],
+            errors: Vec::new(),
+        };
+
+        let pod = &topology.pods[0];
+
+        let Some(replica_set_owner) = controller_owner(&pod.metadata).filter(|owner| owner.kind == "ReplicaSet" && owner.api_version == "apps/v1") else {
+            return Ok(topology);
+        };
+
+        let replica_set = match workloads::get_replica_set(self.client.inner(), namespace, &replica_set_owner.name).await {
+            Ok(replica_set) => replica_set,
+            Err(error) => {
+                topology.errors.push(CollectionError {
+                    resource: Some(target),
+                    source: ObservationSource::ResourceState,
+                    message: format!(
+                        "failed to collect parent ReplicaSet {namespace}/{} for Pod {namespace}/{name}: {error}",
+                        replica_set_owner.name,
+                    ),
+                    retryable: is_retryable(&error),
+                });
+
+                return Ok(topology);
+            }
+        };
+
+        let actual_uid = replica_set.uid();
+
+        if actual_uid.as_deref() != Some(replica_set_owner.uid.as_str()) {
+            topology.errors.push(CollectionError {
+                resource: Some(target),
+                source: ObservationSource::ResourceState,
+                message: format!(
+                    "parent ReplicaSet {namespace}/{} has UID {}, but Pod {namespace}/{name} references UID {}; the ReplicaSet may have been deleted and recreated",
+                    replica_set_owner.name,
+                    actual_uid.as_deref().unwrap_or("<missing>"),
+                    replica_set_owner.uid,
+                ),
+                retryable: false,
+            });
+
+            return Ok(topology);
+        }
+
+        let parent_deployment = workloads::deployment_for_replica_set(self.client.inner(), namespace, &replica_set).await;
+
+        match parent_deployment {
+            Ok(ParentDeployment::Found(deployment)) => {
+                topology.deployment = Some(deployment);
+            }
+            Ok(ParentDeployment::UidMismatch { expected, actual }) => {
+                let replica_set_ref = workloads::replica_set_snapshot(&replica_set).resource;
+
+                topology.errors.push(CollectionError {
+                    resource: Some(replica_set_ref),
+                    source: ObservationSource::ResourceState,
+                    message: format!(
+                        "parent Deployment for ReplicaSet {namespace}/{} has UID {}, but its owner reference expects UID {expected}; the Deployment may have been deleted and recreated",
+                        replica_set_owner.name,
+                        actual.as_deref().unwrap_or("<missing>"),
+                    ),
+                    retryable: false,
+                });
+            }
+            Ok(ParentDeployment::None) => {}
+            Err(error) => {
+                let replica_set_ref = workloads::replica_set_snapshot(&replica_set).resource;
+
+                topology.errors.push(CollectionError {
+                    resource: Some(replica_set_ref),
+                    source: ObservationSource::ResourceState,
+                    message: format!(
+                        "failed to collect parent Deployment for ReplicaSet {namespace}/{}: {error}",
+                        replica_set_owner.name,
+                    ),
+                    retryable: is_retryable(&error),
+                });
+            }
+        }
+
+        topology.replica_sets.push(replica_set);
+
+        Ok(topology)
+    }
+
+    async fn resolve_replica_set(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<CollectedTopology, kube::Error> {
+        let replica_set = workloads::get_replica_set(self.client.inner(), namespace, name).await?;
+
+        let target = workloads::replica_set_snapshot(&replica_set)
+            .resource
+            .clone();
+
+        let pods =
+            workloads::list_pods_for_replica_set(self.client.inner(), namespace, &replica_set)
+                .await?;
+
+        let mut errors = Vec::new();
+
+        let deployment: Option<Deployment> = match workloads::deployment_for_replica_set(
+            self.client.inner(),
+            namespace,
+            &replica_set,
+        )
+        .await
+        {
+            Ok(deployment) => match deployment {
+                ParentDeployment::Found(deployment) => Some(deployment),
+                ParentDeployment::UidMismatch { expected, actual } => {
+                    errors.push(CollectionError {
+                        resource: Some(target.clone()),
+                        source: ObservationSource::ResourceState,
+                        message: format!(
+                            "parent Deployment for ReplicaSet {namespace}/{name} has UID {}, but the ReplicaSet owner reference expects UID {expected}; the Deployment may have been deleted and recreated",
+                            actual.as_deref().unwrap_or("<missing>")
+                        ),
+                        retryable: false,
+                    });
+
+                    None
+                }
+                ParentDeployment::None => None,
+            },
+            Err(error) => {
+                errors.push(CollectionError {
+                    resource: Some(target.clone()),
+                    source: ObservationSource::ResourceState,
+                    message: format!("failed to collect parent Deployment for ReplicaSet {namespace}/{name}: {error}"),
+                    retryable: is_retryable(&error),
+                });
+
+                None
+            }
+        };
+
+        Ok(CollectedTopology {
+            target,
+            deployment,
+            replica_sets: vec![replica_set],
+            pods,
+            errors,
+        })
+    }
+
+    async fn resolve_deployment(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<CollectedTopology, kube::Error> {
+        let deployment = workloads::get_deployment(self.client.inner(), namespace, name).await?;
+
+        let target = workloads::deployment_snapshot(&deployment).resource.clone();
+
+        let replica_sets = workloads::list_replica_sets_for_deployment(
+            self.client.inner(),
+            namespace,
+            &deployment,
+        )
+        .await?;
+
+        let owner_uids = replica_sets
+            .iter()
+            .filter_map(ResourceExt::uid)
+            .collect::<HashSet<_>>();
+
+        let pods = workloads::list_pods_for_replica_sets(
+            self.client.inner(),
+            namespace,
+            &deployment,
+            &owner_uids,
+        )
+        .await?;
+
+        Ok(CollectedTopology {
+            target,
+            deployment: Some(deployment),
+            replica_sets,
+            pods,
+            errors: Vec::new(),
+        })
+    }
 }
 
 fn controller_owner(metadata: &ObjectMeta) -> Option<&OwnerReference> {

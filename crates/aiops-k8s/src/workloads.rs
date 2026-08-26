@@ -1,10 +1,15 @@
+use std::collections::HashSet;
+
 use aiops_core::{
     observations::WorkloadObservation,
     resources::{ResourceCondition, ResourceKind, ResourceMetadata, ResourceSnapshot},
 };
 use chrono::{DateTime, Utc};
-use k8s_openapi::api::apps::v1::{DaemonSet, Deployment, ReplicaSet, StatefulSet};
-use kube::{Api, Client, api::ListParams};
+use k8s_openapi::api::{
+    apps::v1::{DaemonSet, Deployment, ReplicaSet, StatefulSet},
+    core::v1::Pod,
+};
+use kube::{Api, Client, ResourceExt, api::ListParams, core::Selector};
 
 use crate::convert::resource_ref;
 
@@ -12,6 +17,15 @@ pub struct Workloads {
     pub deployments: Vec<Deployment>,
     pub stateful_sets: Vec<StatefulSet>,
     pub daemon_sets: Vec<DaemonSet>,
+}
+
+pub enum ParentDeployment {
+    None,
+    Found(Deployment),
+    UidMismatch {
+        expected: String,
+        actual: Option<String>,
+    }
 }
 
 pub async fn list(client: Client, namespace: Option<&str>) -> Result<Workloads, kube::Error> {
@@ -150,7 +164,10 @@ pub fn replica_set_observation(replica_set: &ReplicaSet) -> WorkloadObservation 
             .and_then(|spec| spec.replicas)
             .map(non_negative)
             .unwrap_or(1),
-        current_replicas: status.map(|status| status.replicas).map(non_negative).unwrap_or(0),
+        current_replicas: status
+            .map(|status| status.replicas)
+            .map(non_negative)
+            .unwrap_or(0),
         ready_replicas: status
             .and_then(|status| status.ready_replicas)
             .map(non_negative)
@@ -188,6 +205,153 @@ pub fn deployment_observation(deployment: &Deployment) -> WorkloadObservation {
             .map(non_negative),
         conditions: snapshot.conditions,
     }
+}
+
+pub async fn deployment_for_replica_set(
+    client: Client,
+    namespace: &str,
+    replica_set: &ReplicaSet,
+) -> Result<ParentDeployment, kube::Error> {
+    let Some(owner) = replica_set
+        .metadata
+        .owner_references
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .find(|owner| {
+            owner.controller == Some(true)
+                && owner.kind == "Deployment"
+                && owner.api_version == "apps/v1"
+        })
+    else {
+        return Ok(ParentDeployment::None);
+    };
+
+    let deployment = get_deployment(client, namespace, &owner.name).await?;
+
+    if deployment.uid().as_deref() != Some(owner.uid.as_str()) {
+        return Ok(ParentDeployment::UidMismatch { expected: owner.uid.clone(), actual: deployment.uid() });
+    }
+
+    Ok(ParentDeployment::Found(deployment))
+}
+
+pub async fn list_pods_for_replica_set(
+    client: Client,
+    namespace: &str,
+    replica_set: &ReplicaSet,
+) -> Result<Vec<Pod>, kube::Error> {
+    let Some(replica_set_uid) = replica_set.uid() else {
+        return Ok(Vec::new());
+    };
+
+    let params = replica_set
+        .spec
+        .as_ref()
+        .and_then(|spec| Selector::try_from(spec.selector.clone()).ok())
+        .map(|selector| ListParams::default().labels_from(&selector))
+        .unwrap_or_default();
+
+    let listed = Api::<Pod>::namespaced(client, namespace)
+        .list(&params)
+        .await?;
+
+    Ok(listed
+        .items
+        .into_iter()
+        .filter(|pod| {
+            pod.metadata
+                .owner_references
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .any(|owner| {
+                    owner.controller == Some(true)
+                        && owner.kind == "ReplicaSet"
+                        && owner.api_version == "apps/v1"
+                        && owner.uid == replica_set_uid
+                })
+        })
+        .collect())
+}
+
+pub async fn list_pods_for_replica_sets(
+    client: Client,
+    namespace: &str,
+    deployment: &Deployment,
+    owner_uids: &HashSet<String>,
+) -> Result<Vec<Pod>, kube::Error> {
+    if owner_uids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let params = deployment
+        .spec
+        .as_ref()
+        .and_then(|spec| Selector::try_from(spec.selector.clone()).ok())
+        .map(|selector| ListParams::default().labels_from(&selector))
+        .unwrap_or_default();
+
+    let listed = Api::<Pod>::namespaced(client, namespace)
+        .list(&params)
+        .await?;
+
+    Ok(listed
+        .items
+        .into_iter()
+        .filter(|pod| {
+            pod.metadata
+                .owner_references
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .any(|owner| {
+                    owner.controller == Some(true)
+                        && owner.kind == "ReplicaSet"
+                        && owner.api_version == "apps/v1"
+                        && owner_uids.contains(&owner.uid)
+                })
+        })
+        .collect())
+}
+
+pub async fn list_replica_sets_for_deployment(
+    client: Client,
+    namespace: &str,
+    deployment: &Deployment,
+) -> Result<Vec<ReplicaSet>, kube::Error> {
+    let Some(deployment_uid) = deployment.uid() else {
+        return Ok(Vec::new());
+    };
+
+    let params = deployment
+        .spec
+        .as_ref()
+        .and_then(|spec| Selector::try_from(spec.selector.clone()).ok())
+        .map(|selector| ListParams::default().labels_from(&selector))
+        .unwrap_or_default();
+
+    let listed = Api::<ReplicaSet>::namespaced(client, namespace)
+        .list(&params)
+        .await?;
+
+    Ok(listed
+        .items
+        .into_iter()
+        .filter(|replica_set| {
+            replica_set
+                .metadata
+                .owner_references
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .any(|owner| {
+                    owner.controller == Some(true)
+                        && owner.api_version == "apps/v1"
+                        && owner.uid == deployment_uid
+                })
+        })
+        .collect())
 }
 
 fn non_negative(value: i32) -> u32 {
