@@ -59,13 +59,23 @@ You can also run it without creating a `result` link:
 nix run .#run -- --help
 ```
 
-## Collect pod information
+## Collect Kubernetes resource information
 
 The `collect` command writes a raw observation bundle as JSON:
 
 ```console
 nix run .#run -- collect pod api-0 --namespace production
 ```
+
+Pods, ReplicaSets, and Deployments are supported:
+
+```console
+nix run .#run -- collect replica-set api-7b9f6d8c5 --namespace production
+nix run .#run -- collect deployment api --namespace production
+```
+
+Workload collection includes controller-owner relationships, workload state, owned pods, recent
+events, and logs from unhealthy owned pods.
 
 The default lookback is 15 minutes. The default log limit is 500 lines per container.
 
@@ -86,15 +96,16 @@ The following flags can disable parts of collection:
 
 `--since` is an alias for `--lookback`. Durations can use seconds, minutes, hours, or days, such as `30s`, `15m`, `2h`, or `1d`.
 
-## Diagnose a pod
+## Diagnose a Kubernetes resource
 
-The `diagnose` command collects the pod information and runs all current diagnostic rules:
+The `diagnose` command collects the resource information and runs all current diagnostic rules:
 
 ```console
 nix run .#run -- diagnose pod api-0 --namespace production
+nix run .#run -- diagnose deployment api --namespace production
 ```
 
-The result is a JSON diagnosis report. Each finding contains:
+The result is a JSON Incident. Each finding contains:
 
 - A stable finding code.
 - Severity and confidence.
@@ -103,7 +114,8 @@ The result is a JSON diagnosis report. Each finding contains:
 - Supporting evidence.
 - Suggested next steps.
 
-If an event or log request fails, the report can still contain useful findings. In that case, `incomplete` is `true` and `collection_errors` explains what failed.
+If an event, log, or ownership request fails, the Incident can still contain useful findings. In
+that case, `status` is `incomplete` and `observations.errors` explains what failed.
 
 ## Run tests
 

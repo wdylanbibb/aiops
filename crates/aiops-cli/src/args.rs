@@ -34,12 +34,20 @@ pub(crate) struct DiagnoseArgs {
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub(crate) enum ResourceCommand {
     /// Collect health, events, and logs for a pod.
-    Pod(PodArgs),
+    Pod(ResourceArgs),
+
+    /// Collect state, owned pods, events, and unhealthy pod logs for a ReplicaSet.
+    #[command(visible_aliases = ["replicaset", "rs"])]
+    ReplicaSet(ResourceArgs),
+
+    /// Collect state, ReplicaSets, owned pods, events, and unhealthy pod logs for a Deployment.
+    #[command(visible_alias = "deploy")]
+    Deployment(ResourceArgs),
 }
 
 #[derive(Debug, Args, PartialEq, Eq)]
-pub(crate) struct PodArgs {
-    /// Name of the pod to collect.
+pub(crate) struct ResourceArgs {
+    /// Name of the Kubernetes resource to collect.
     pub name: String,
 
     /// Kubernetes namespace containing the pod.
@@ -108,7 +116,7 @@ mod tests {
             cli,
             Cli {
                 command: Command::Collect(CollectArgs {
-                    resource: ResourceCommand::Pod(PodArgs {
+                    resource: ResourceCommand::Pod(ResourceArgs {
                         name: "api-0".to_owned(),
                         namespace: "default".to_owned(),
                         lookback: Duration::from_secs(15 * 60),
@@ -194,5 +202,45 @@ mod tests {
         assert!(
             Cli::try_parse_from(["aiops", "collect", "pod", "api-0", "--tail-lines", "0"]).is_err()
         );
+    }
+
+    #[test]
+    fn parses_collect_deployment_with_workload_options() {
+        let cli = Cli::try_parse_from([
+            "aiops",
+            "collect",
+            "deployment",
+            "api",
+            "--namespace",
+            "production",
+            "--no-logs",
+        ])
+        .unwrap();
+
+        let Command::Collect(CollectArgs {
+            resource: ResourceCommand::Deployment(args),
+        }) = cli.command
+        else {
+            panic!("expected collect deployment command");
+        };
+
+        assert_eq!(args.name, "api");
+        assert_eq!(args.namespace, "production");
+        assert!(args.no_logs);
+    }
+
+    #[test]
+    fn parses_diagnose_replica_set_alias() {
+        let cli = Cli::try_parse_from(["aiops", "diagnose", "rs", "api-abc"]).unwrap();
+
+        let Command::Diagnose(DiagnoseArgs {
+            resource: ResourceCommand::ReplicaSet(args),
+        }) = cli.command
+        else {
+            panic!("expected diagnose replica-set command");
+        };
+
+        assert_eq!(args.name, "api-abc");
+        assert_eq!(args.namespace, "default");
     }
 }

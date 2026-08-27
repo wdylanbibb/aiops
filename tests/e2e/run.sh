@@ -66,6 +66,24 @@ diagnose() {
     >"$output_dir/$pod.json"
 }
 
+collect_resource() {
+  local kind="$1"
+  local name="$2"
+  local output="$3"
+  cargo run --quiet --manifest-path "$repo_root/Cargo.toml" -p aiops-cli -- \
+    collect "$kind" "$name" --namespace "$namespace" --lookback 15m \
+    >"$output_dir/$output.json"
+}
+
+diagnose_resource() {
+  local kind="$1"
+  local name="$2"
+  local output="$3"
+  cargo run --quiet --manifest-path "$repo_root/Cargo.toml" -p aiops-cli -- \
+    diagnose "$kind" "$name" --namespace "$namespace" --lookback 15m \
+    >"$output_dir/$output.json"
+}
+
 has_code() {
   local pod="$1"
   local code="$2"
@@ -113,6 +131,15 @@ for pod in healthy crash-loop image-pull-error readiness-failure log-patterns; d
   diagnose "$pod"
 done
 diagnose "$owned_crash_loop_pod"
+
+owned_replica_set="$(jq -r '
+  .observations.resources[] |
+  select(.resource.kind == "replica_set") |
+  .resource.name
+' "$output_dir/$owned_crash_loop_pod.json" | head -n 1)"
+
+diagnose_resource deployment owned-crash-loop deployment-owned-crash-loop
+collect_resource replica-set "$owned_replica_set" replica-set-owned-crash-loop
 
 jq -e '
   (.findings | length == 0) and
@@ -176,5 +203,31 @@ jq -e --arg pod "$owned_crash_loop_pod" '
 
 has_code_prefix "$owned_crash_loop_pod" container.restart.
 has_code "$owned_crash_loop_pod" log.process_crash
+
+jq -e '
+  .target.kind == "deployment" and
+  .target.name == "owned-crash-loop" and
+  .status == "open" and
+  any(.observations.relationships[];
+    .owner.kind == "deployment" and .dependent.kind == "replica_set") and
+  any(.observations.relationships[];
+    .owner.kind == "replica_set" and .dependent.kind == "pod") and
+  any(.findings[];
+    .code == "workload.replicas_unavailable" and
+    .subject.kind == "deployment")
+' "$output_dir/deployment-owned-crash-loop.json" >/dev/null
+
+jq -e --arg replica_set "$owned_replica_set" '
+  .target.kind == "replica_set" and
+  .target.name == $replica_set and
+  any(.resources[];
+    .resource.kind == "deployment" and .resource.name == "owned-crash-loop") and
+  any(.relationships[];
+    .owner.kind == "deployment" and .dependent.name == $replica_set) and
+  any(.relationships[];
+    .owner.name == $replica_set and .dependent.kind == "pod") and
+  any(.workloads[];
+    .resource.kind == "replica_set" and .resource.name == $replica_set)
+' "$output_dir/replica-set-owned-crash-loop.json" >/dev/null
 
 echo "All kind end-to-end tests passed. Reports are in $output_dir"
