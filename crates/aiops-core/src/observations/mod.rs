@@ -67,3 +67,52 @@ pub enum ObservationSource {
     Events,
     Health,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundle_deserialization_defaults_new_topology_fields_and_error_kind() {
+        let bundle: ObservationBundle = serde_json::from_value(serde_json::json!({
+            "target": {
+                "kind": "pod",
+                "namespace": "default",
+                "name": "api-0",
+                "uid": null
+            },
+            "collected_from": "2026-01-02T03:04:05Z",
+            "collected_at": "2026-01-02T03:04:05Z",
+            "resources": [],
+            "logs": [],
+            "events": [],
+            "health": [],
+            "errors": [{
+                "resource": null,
+                "source": "events",
+                "message": "unavailable",
+                "retryable": true
+            }]
+        }))
+        .unwrap();
+
+        assert!(bundle.relationships.is_empty());
+        assert!(bundle.workloads.is_empty());
+        assert_eq!(bundle.errors[0].kind, CollectionErrorKind::Unknown);
+    }
+
+    #[test]
+    fn collection_error_contract_uses_stable_kind_names() {
+        let error = CollectionError {
+            resource: None,
+            source: ObservationSource::ResourceState,
+            kind: CollectionErrorKind::UidMismatch,
+            message: "owner changed".into(),
+            retryable: false,
+        };
+
+        let value = serde_json::to_value(error).unwrap();
+        assert_eq!(value["source"], "resource_state");
+        assert_eq!(value["kind"], "uid_mismatch");
+    }
+}

@@ -820,10 +820,13 @@ mod tests {
     use aiops_core::{
         diagnostics::DiagnosticRule,
         observations::{
-            CollectionError, ContainerKind, HealthObservation, LogStream, ObservationBundle,
-            ResourceEvent,
+            CollectionError, CollectionErrorKind, ContainerKind, HealthObservation, LogStream,
+            ObservationBundle, ResourceEvent,
         },
-        resources::{ResourceCondition, ResourceKind},
+        resources::{
+            ResourceCondition, ResourceKind, ResourceMetadata, ResourceRelationship,
+            ResourceSnapshot,
+        },
     };
     use chrono::TimeZone;
 
@@ -837,6 +840,28 @@ mod tests {
             namespace: Some("default".into()),
             name: name.into(),
             uid: None,
+        }
+    }
+
+    fn workload_resource(kind: ResourceKind, name: &str) -> ResourceRef {
+        ResourceRef {
+            kind,
+            namespace: Some("default".into()),
+            name: name.into(),
+            uid: Some(format!("{name}-uid")),
+        }
+    }
+
+    fn workload(kind: ResourceKind, name: &str, desired: u32, ready: u32) -> WorkloadObservation {
+        WorkloadObservation {
+            resource: workload_resource(kind, name),
+            observed_at: at(),
+            desired_replicas: desired,
+            current_replicas: ready,
+            ready_replicas: ready,
+            available_replicas: Some(ready),
+            updated_replicas: Some(ready),
+            conditions: vec![],
         }
     }
 
@@ -1032,6 +1057,111 @@ mod tests {
         assert_eq!(crash.evidence.len(), 5);
         assert!(crash.explanation.contains("7 log line(s)"));
         assert!(crash.evidence[0].summary.contains("(previous)"));
+    }
+
+    #[test]
+    fn replica_availability_severity_tracks_outage_and_ignores_scale_to_zero() {
+        let mut input = bundle();
+        input.workloads.extend([
+            workload(ResourceKind::Deployment, "down", 3, 0),
+            workload(ResourceKind::ReplicaSet, "degraded", 3, 2),
+            workload(ResourceKind::Deployment, "scaled-down", 0, 0),
+        ]);
+
+        let findings = WorkloadReplicaAvailabilityRule.evaluate(&input);
+
+        assert_eq!(findings.len(), 2);
+        assert_eq!(findings[0].severity, Severity::Critical);
+        assert_eq!(findings[1].severity, Severity::Warning);
+        assert!(findings[0].evidence[0].summary.contains("updated=0"));
+    }
+
+    #[test]
+    fn rollout_stalled_requires_the_deployment_deadline_condition() {
+        let mut input = bundle();
+        let mut deployment = workload(ResourceKind::Deployment, "api", 3, 1);
+        deployment.conditions.push(ResourceCondition {
+            condition_type: "Progressing".into(),
+            status: ConditionStatus::False,
+            reason: Some("ProgressDeadlineExceeded".into()),
+            message: Some("deployment exceeded its progress deadline".into()),
+        });
+        let mut replica_set = deployment.clone();
+        replica_set.resource = workload_resource(ResourceKind::ReplicaSet, "api-abc");
+        input.workloads.extend([deployment, replica_set]);
+
+        let findings = WorkloadRolloutStalledRule.evaluate(&input);
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].subject.kind, ResourceKind::Deployment);
+        assert_eq!(findings[0].severity, Severity::Critical);
+        assert!(findings[0].explanation.contains("progress deadline"));
+    }
+
+    #[test]
+    fn generation_rule_only_reports_controller_lag() {
+        let mut input = bundle();
+        for (name, generation, observed_generation) in [("lagging", 4, 3), ("current", 4, 4)] {
+            input.resources.push(ResourceSnapshot {
+                resource: workload_resource(ResourceKind::Deployment, name),
+                observed_at: at(),
+                metadata: ResourceMetadata {
+                    generation: Some(generation),
+                    observed_generation: Some(observed_generation),
+                    ..Default::default()
+                },
+                conditions: vec![],
+            });
+        }
+
+        let findings = WorkloadGenerationRule.evaluate(&input);
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].subject.name, "lagging");
+    }
+
+    #[test]
+    fn owned_pod_rule_traverses_deployment_replica_set_pod_graph() {
+        let mut input = bundle();
+        let deployment = workload(ResourceKind::Deployment, "api", 2, 0);
+        let replica_set = workload_resource(ResourceKind::ReplicaSet, "api-abc");
+        let pod = resource("api-abc-123");
+        input.workloads.push(deployment.clone());
+        input.relationships.extend([
+            ResourceRelationship {
+                kind: RelationshipKind::ControllerOwner,
+                owner: deployment.resource,
+                dependent: replica_set.clone(),
+            },
+            ResourceRelationship {
+                kind: RelationshipKind::ControllerOwner,
+                owner: replica_set,
+                dependent: pod,
+            },
+        ]);
+
+        assert!(WorkloadNoOwnedPodsRule.evaluate(&input).is_empty());
+    }
+
+    #[test]
+    fn owned_pod_rule_reports_absence_but_suppresses_incomplete_child_lists() {
+        let mut input = bundle();
+        input
+            .workloads
+            .push(workload(ResourceKind::Deployment, "api", 2, 0));
+
+        let findings = WorkloadNoOwnedPodsRule.evaluate(&input);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].code, "workload.no_owned_pods");
+
+        input.errors.push(CollectionError {
+            resource: None,
+            source: ObservationSource::ResourceState,
+            kind: CollectionErrorKind::ChildList,
+            message: "replica sets could not be listed".into(),
+            retryable: true,
+        });
+        assert!(WorkloadNoOwnedPodsRule.evaluate(&input).is_empty());
     }
 
     #[test]

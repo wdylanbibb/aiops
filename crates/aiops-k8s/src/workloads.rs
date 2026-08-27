@@ -264,17 +264,7 @@ pub async fn list_pods_for_replica_set(
         .items
         .into_iter()
         .filter(|pod| {
-            pod.metadata
-                .owner_references
-                .as_deref()
-                .unwrap_or_default()
-                .iter()
-                .any(|owner| {
-                    owner.controller == Some(true)
-                        && owner.kind == "ReplicaSet"
-                        && owner.api_version == "apps/v1"
-                        && owner.uid == replica_set_uid
-                })
+            has_controller_owner(&pod.metadata, "ReplicaSet", |uid| uid == replica_set_uid)
         })
         .collect())
 }
@@ -304,17 +294,7 @@ pub async fn list_pods_for_replica_sets(
         .items
         .into_iter()
         .filter(|pod| {
-            pod.metadata
-                .owner_references
-                .as_deref()
-                .unwrap_or_default()
-                .iter()
-                .any(|owner| {
-                    owner.controller == Some(true)
-                        && owner.kind == "ReplicaSet"
-                        && owner.api_version == "apps/v1"
-                        && owner_uids.contains(&owner.uid)
-                })
+            has_controller_owner(&pod.metadata, "ReplicaSet", |uid| owner_uids.contains(uid))
         })
         .collect())
 }
@@ -343,20 +323,29 @@ pub async fn list_replica_sets_for_deployment(
         .items
         .into_iter()
         .filter(|replica_set| {
-            replica_set
-                .metadata
-                .owner_references
-                .as_deref()
-                .unwrap_or_default()
-                .iter()
-                .any(|owner| {
-                    owner.controller == Some(true)
-                        && owner.kind == "Deployment"
-                        && owner.api_version == "apps/v1"
-                        && owner.uid == deployment_uid
-                })
+            has_controller_owner(&replica_set.metadata, "Deployment", |uid| {
+                uid == deployment_uid
+            })
         })
         .collect())
+}
+
+fn has_controller_owner(
+    metadata: &ObjectMeta,
+    kind: &str,
+    matches_uid: impl Fn(&str) -> bool,
+) -> bool {
+    metadata
+        .owner_references
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|owner| {
+            owner.controller == Some(true)
+                && owner.kind == kind
+                && owner.api_version == "apps/v1"
+                && matches_uid(&owner.uid)
+        })
 }
 
 fn desired_replicas(value: Option<i32>) -> u32 {
@@ -372,4 +361,128 @@ fn timestamp(time: &k8s_openapi::apimachinery::pkg::apis::meta::v1::Time) -> Dat
     let nsecs = time.0.subsec_nanosecond() as u32;
 
     DateTime::from_timestamp(secs, nsecs).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
+
+    fn deployment(value: serde_json::Value) -> Deployment {
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn replica_set(value: serde_json::Value) -> ReplicaSet {
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn deployment_conversion_preserves_status_conditions_and_metadata() {
+        let deployment = deployment(serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {
+                "name": "api",
+                "namespace": "production",
+                "uid": "deployment-uid",
+                "generation": 7,
+                "labels": {"app": "api"},
+                "annotations": {"owner": "platform"}
+            },
+            "spec": {
+                "replicas": 3,
+                "selector": {"matchLabels": {"app": "api"}},
+                "template": {"metadata": {"labels": {"app": "api"}}, "spec": {"containers": []}}
+            },
+            "status": {
+                "observedGeneration": 6,
+                "replicas": 3,
+                "readyReplicas": 1,
+                "availableReplicas": 1,
+                "updatedReplicas": 2,
+                "conditions": [{
+                    "type": "Progressing",
+                    "status": "False",
+                    "reason": "ProgressDeadlineExceeded",
+                    "message": "rollout timed out"
+                }]
+            }
+        }));
+
+        let converted = convert_deployment(&deployment);
+
+        assert_eq!(converted.snapshot.resource, converted.observation.resource);
+        assert_eq!(
+            converted.snapshot.observed_at,
+            converted.observation.observed_at
+        );
+        assert_eq!(converted.snapshot.metadata.generation, Some(7));
+        assert_eq!(converted.snapshot.metadata.observed_generation, Some(6));
+        assert_eq!(converted.snapshot.metadata.labels["app"], "api");
+        assert_eq!(converted.observation.desired_replicas, 3);
+        assert_eq!(converted.observation.current_replicas, 3);
+        assert_eq!(converted.observation.ready_replicas, 1);
+        assert_eq!(converted.observation.updated_replicas, Some(2));
+        assert_eq!(
+            converted.observation.conditions[0].status,
+            ConditionStatus::False
+        );
+        assert_eq!(converted.snapshot.conditions.len(), 1);
+        assert_eq!(
+            converted.snapshot.conditions[0].reason.as_deref(),
+            Some("ProgressDeadlineExceeded")
+        );
+    }
+
+    #[test]
+    fn workload_conversion_defaults_and_clamps_replica_counts() {
+        let replica_set = replica_set(serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "ReplicaSet",
+            "metadata": {"name": "api-abc", "namespace": "default"},
+            "spec": {
+                "selector": {"matchLabels": {"app": "api"}},
+                "template": {"metadata": {"labels": {"app": "api"}}, "spec": {"containers": []}}
+            },
+            "status": {"replicas": -2, "readyReplicas": -1, "availableReplicas": -3}
+        }));
+
+        let converted = convert_replica_set(&replica_set);
+
+        assert_eq!(converted.observation.desired_replicas, 1);
+        assert_eq!(converted.observation.current_replicas, 0);
+        assert_eq!(converted.observation.ready_replicas, 0);
+        assert_eq!(converted.observation.available_replicas, Some(0));
+        assert_eq!(converted.observation.updated_replicas, None);
+    }
+
+    #[test]
+    fn controller_owner_requires_controller_api_kind_and_matching_uid() {
+        let mut metadata = ObjectMeta {
+            owner_references: Some(vec![OwnerReference {
+                api_version: "apps/v1".into(),
+                kind: "ReplicaSet".into(),
+                name: "api-abc".into(),
+                uid: "rs-uid".into(),
+                controller: Some(true),
+                block_owner_deletion: None,
+            }]),
+            ..Default::default()
+        };
+
+        assert!(has_controller_owner(&metadata, "ReplicaSet", |uid| uid == "rs-uid"));
+        assert!(!has_controller_owner(&metadata, "Deployment", |_| true));
+        assert!(!has_controller_owner(&metadata, "ReplicaSet", |uid| uid == "other"));
+
+        metadata.owner_references.as_mut().unwrap()[0].controller = Some(false);
+        assert!(!has_controller_owner(&metadata, "ReplicaSet", |_| true));
+    }
+
+    #[test]
+    fn condition_conversion_treats_non_boolean_status_as_unknown() {
+        let condition = convert_condition("Ready", "Maybe", Some("Pending"), None);
+
+        assert_eq!(condition.status, ConditionStatus::Unknown);
+        assert_eq!(condition.reason.as_deref(), Some("Pending"));
+    }
 }

@@ -841,4 +841,56 @@ mod tests {
         ));
         assert!(event_within_window(&event(None, None), cutoff));
     }
+
+    #[test]
+    fn event_deduplication_ignores_count_but_preserves_distinct_occurrences() {
+        let first = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
+        let later = first + Duration::minutes(1);
+        let mut events = vec![
+            event(Some(first), Some(later)),
+            event(Some(first), Some(later)),
+            event(Some(first), Some(first)),
+        ];
+        events[1].count = 9;
+
+        deduplicate_events(&mut events);
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].count, 1);
+    }
+
+    #[test]
+    fn missing_log_metadata_is_a_non_retryable_structured_error() {
+        let resource = ResourceRef {
+            kind: ResourceKind::Pod,
+            namespace: Some("production".into()),
+            name: "api-0".into(),
+            uid: None,
+        };
+
+        let error = missing_log_metadata_error(&resource, "uid");
+
+        assert_eq!(error.resource, Some(resource));
+        assert_eq!(error.source, ObservationSource::Logs);
+        assert_eq!(error.kind, CollectionErrorKind::InvalidMetadata);
+        assert!(!error.retryable);
+        assert!(error.message.contains("production/api-0"));
+        assert!(error.message.contains("metadata.uid"));
+    }
+
+    #[test]
+    fn missing_resource_uid_prevents_unsafe_ownership_resolution() {
+        let resource = ResourceRef {
+            kind: ResourceKind::Deployment,
+            namespace: Some("production".into()),
+            name: "api".into(),
+            uid: None,
+        };
+
+        let error = missing_resource_uid_error(&resource);
+
+        assert_eq!(error.kind, CollectionErrorKind::InvalidMetadata);
+        assert_eq!(error.source, ObservationSource::ResourceState);
+        assert!(error.message.contains("ownership cannot be resolved"));
+    }
 }

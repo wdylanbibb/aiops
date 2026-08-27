@@ -101,3 +101,103 @@ pub struct Evidence {
     pub summary: String,
     pub timestamp: Option<DateTime<Utc>>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        observations::{CollectionError, CollectionErrorKind},
+        resources::ResourceKind,
+    };
+    use chrono::TimeZone;
+
+    fn target() -> ResourceRef {
+        ResourceRef {
+            kind: ResourceKind::Pod,
+            namespace: Some("default".into()),
+            name: "api-0".into(),
+            uid: Some("pod-uid".into()),
+        }
+    }
+
+    fn bundle() -> ObservationBundle {
+        let at = Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
+        ObservationBundle {
+            target: target(),
+            collected_from: at,
+            collected_at: at,
+            resources: vec![],
+            relationships: vec![],
+            workloads: vec![],
+            logs: vec![],
+            events: vec![],
+            health: vec![],
+            errors: vec![],
+        }
+    }
+
+    fn finding(severity: Severity) -> Finding {
+        Finding {
+            code: "test.finding".into(),
+            severity,
+            confidence: Confidence::High,
+            subject: target(),
+            container: None,
+            title: "test finding".into(),
+            explanation: "test explanation".into(),
+            evidence: vec![],
+            recommendations: vec![],
+        }
+    }
+
+    #[test]
+    fn incident_derives_target_severity_status_and_timestamps() {
+        let observations = bundle();
+        let incident = Incident::new(
+            observations.clone(),
+            vec![finding(Severity::Warning), finding(Severity::Critical)],
+        );
+
+        assert_eq!(incident.target, observations.target);
+        assert_eq!(incident.status, IncidentStatus::Open);
+        assert_eq!(incident.severity, Severity::Critical);
+        assert_eq!(incident.created_at, incident.updated_at);
+        assert_eq!(incident.findings.len(), 2);
+    }
+
+    #[test]
+    fn incident_is_resolved_without_actionable_findings() {
+        let incident = Incident::new(bundle(), vec![finding(Severity::Info)]);
+
+        assert_eq!(incident.status, IncidentStatus::Resolved);
+        assert_eq!(incident.severity, Severity::Info);
+    }
+
+    #[test]
+    fn collection_errors_make_incident_incomplete_even_with_findings() {
+        let mut observations = bundle();
+        observations.errors.push(CollectionError {
+            resource: Some(target()),
+            source: ObservationSource::Events,
+            kind: CollectionErrorKind::EventList,
+            message: "events unavailable".into(),
+            retryable: true,
+        });
+
+        let incident = Incident::new(observations, vec![finding(Severity::Critical)]);
+
+        assert_eq!(incident.status, IncidentStatus::Incomplete);
+        assert_eq!(incident.severity, Severity::Critical);
+    }
+
+    #[test]
+    fn incident_contract_serializes_enums_as_snake_case() {
+        let incident = Incident::new(bundle(), vec![finding(Severity::Warning)]);
+        let value = serde_json::to_value(incident).unwrap();
+
+        assert_eq!(value["status"], "open");
+        assert_eq!(value["severity"], "warning");
+        assert_eq!(value["target"]["kind"], "pod");
+        assert_eq!(value["findings"][0]["confidence"], "high");
+    }
+}
